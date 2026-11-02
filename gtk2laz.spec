@@ -19,7 +19,11 @@ a = Analysis(
     ['gtk2laz.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        # fake libc/GTK stub headers generator (so the bundled exe can
+        # regenerate /tmp/fake_libc_include at runtime)
+        ('gen_fake_includes.py', '.'),
+    ],
     hiddenimports=[
         # ensure sibling modules are pulled in even though they are
         # imported via sys.path manipulation rather than a package.
@@ -27,6 +31,16 @@ a = Analysis(
         'c_parser',
         'widget_map',
         'gtk2laz_gui',
+        'ast_translator',
+        'gen_fake_includes',
+        # pycparser for AST-based translation
+        'pycparser',
+        'pycparser.c_ast',
+        'pycparser.c_parser',
+        'pycparser.c_generator',
+        'pycparser.ply',
+        'pycparser.ply.yacc',
+        'pycparser.ply.lex',
     ],
     hookspath=[],
     hooksconfig={},

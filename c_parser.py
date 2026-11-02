@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -373,27 +374,111 @@ class BodyTranslator:
                     c_line: int = 0) -> None:
         self.todo_count += 1
         pad = self._pad()
+        # Determine the source line for this snippet
+        if c_line == 0:
+            c_line = self._guess_c_line(code)
+        # Build a multi-line comment block containing:
+        #   - the TODO marker + reason
+        #   - the source file:line
+        #   - the full original C snippet (preserving newlines/indent)
         first_line = code.strip().split("\n", 1)[0][:200]
-        msg = f"(* TODO gtk2laz: {reason or 'translate manually'}: {first_line} *)"
-        self.lines.append(f"{pad}{msg}")
-        out_line = self._pas_line
-        self._pas_line += 1
+        # Read the full source context (a few lines around c_line) so the
+        # user sees the original C code exactly as written.
+        source_block = self._read_source_block(c_line, code)
+        # Emit as a multi-line Pascal comment. Pascal supports both
+        #   (* ... *)  and  { ... }  style block comments. We use (* *)
+        # because { } can be ambiguous with set literals in some Pascal
+        # flavours. The comment is structured so that grep can find it:
+        #
+        #   (* TODO gtk2laz: <reason>
+        #      Source: <file>:<line>
+        #      Original C:
+        #        <line 1>
+        #        <line 2>
+        #        ...
+        #   *)
+        reason_str = reason or "translate manually"
+        src_file = self.source_file or "?"
+        # Indent for the comment body (one level deeper than pad)
+        body_pad = pad + "  "
+        lines_out = []
+        lines_out.append(f"{pad}(* TODO gtk2laz: {reason_str}")
+        lines_out.append(f"{body_pad}Source: {src_file}:{c_line}")
+        if source_block:
+            lines_out.append(f"{body_pad}Original C:")
+            for src_line in source_block.splitlines():
+                # Preserve indentation, escape any '*)' sequences inside
+                # the source so we don't accidentally close the comment.
+                safe = src_line.replace("*)", "* )")
+                lines_out.append(f"{body_pad}  {safe}")
+        lines_out.append(f"{pad}*)")
+        for line in lines_out:
+            self.lines.append(line)
+            self._pas_line += 1
+        out_line = self._pas_line - len(lines_out)
         self.skipped_count += 1
         # Record a TodoItem as a plain dict (rather than a dataclass) so
         # that JSON serialisation works uniformly under PyInstaller.
-        # c_line is the 1-based line number in the original C source.
-        # If unknown (0), try to derive from the function body offset.
-        if c_line == 0:
-            c_line = self._guess_c_line(code)
+        # The full source block is stored in source_text for the GUI.
         self.todos.append({
             "source_file": self.source_file,
             "source_line": c_line,
-            "source_text": first_line,
+            "source_text": source_block or first_line,
             "output_file": "",   # filled in by the caller after writing
             "output_line": out_line,
-            "reason": reason or "translate manually",
+            "reason": reason_str,
             "function": self.func.name,
         })
+
+    def _read_source_block(self, c_line: int, code: str) -> str:
+        """Read the original C source lines corresponding to ``code``.
+
+        Returns the source text (possibly multi-line) that matches the
+        snippet, with original indentation preserved. Falls back to the
+        raw ``code`` argument if the source file is unavailable.
+        """
+        if not self.source_file or c_line <= 0:
+            # No source file context - just return the code snippet
+            return code.strip()
+        try:
+            with open(self.source_file, "r",
+                      encoding="utf-8", errors="replace") as f:
+                src_lines = f.readlines()
+        except OSError:
+            return code.strip()
+        if c_line > len(src_lines):
+            return code.strip()
+        # Determine how many lines the snippet spans. We look at the
+        # code argument's line count and also count braces to handle
+        # multi-statement snippets.
+        snippet_lines = code.strip().split("\n")
+        n_lines = len(snippet_lines)
+        # If the snippet is a single line but the source line ends with
+        # an open brace or semicolon-followed-by-more, extend the block
+        # to capture the full statement (up to ~30 lines for safety).
+        if n_lines == 1:
+            # Count braces/parens from c_line onwards until balanced
+            depth = 0
+            collected = []
+            for i in range(c_line - 1, min(c_line + 30, len(src_lines))):
+                line = src_lines[i].rstrip("\n")
+                collected.append(line)
+                depth += line.count("{") - line.count("}")
+                depth += line.count("(") - line.count(")")
+                # Stop after we've seen at least one statement terminator
+                # AND braces are balanced
+                if depth <= 0 and (";" in line or "}" in line):
+                    # Check if this line completes a statement
+                    if ";" in line or line.strip().endswith("}"):
+                        break
+            if len(collected) > 1:
+                return "\n".join(collected)
+        # Multi-line snippet: read the corresponding number of source lines
+        end_line = min(c_line + n_lines - 1, len(src_lines))
+        block = []
+        for i in range(c_line - 1, end_line):
+            block.append(src_lines[i].rstrip("\n"))
+        return "\n".join(block) if block else code.strip()
 
     def _guess_c_line(self, code: str) -> int:
         """Best-effort: locate ``code`` inside the function body and
@@ -409,15 +494,31 @@ class BodyTranslator:
                 src_lines = f.readlines()
         except OSError:
             return self.func.start_line
+        # Try to find a unique snippet match within the function body.
+        # We look for the longest distinctive substring of the snippet
+        # (skip common prefixes like whitespace, comments, braces).
+        # Try progressively shorter substrings to find a match.
+        candidates = []
+        # Try the full first line stripped of leading whitespace
+        clean_snippet = snippet.strip()
+        if len(clean_snippet) >= 6:
+            candidates.append(clean_snippet)
+        # Try the first identifier or operator-heavy part
+        for length in [60, 40, 20, 10]:
+            if len(clean_snippet) >= length:
+                candidates.append(clean_snippet[:length])
         # Search within the function body range first.
-        for i in range(self.func.start_line - 1,
-                        min(self.func.end_line, len(src_lines))):
-            if snippet in src_lines[i]:
-                return i + 1
+        for cand in candidates:
+            for i in range(self.func.start_line - 1,
+                            min(self.func.end_line, len(src_lines))):
+                if cand in src_lines[i]:
+                    return i + 1
         # Fall back to whole-file scan.
-        for i, line in enumerate(src_lines):
-            if snippet in line:
-                return i + 1
+        for cand in candidates:
+            for i, line in enumerate(src_lines):
+                if cand in line:
+                    return i + 1
+        # Last resort: function start line (not 1)
         return self.func.start_line
 
     def _emit_local(self, decl: str) -> None:
@@ -1058,16 +1159,33 @@ class BodyTranslator:
 # Pascal unit emitter for a C source file
 # ---------------------------------------------------------------------------
 class CFileTranslator:
-    """Translate one .c file into one .pas unit."""
+    """Translate one .c file into one .pas unit.
+
+    Two-pass hybrid:
+      1. Try pycparser (AST-based) for accurate function signatures,
+         typedefs, and globals. If it succeeds, use those exact
+         declarations and only fall back to the pattern-based
+         ``BodyTranslator`` for the function bodies.
+      2. If pycparser fails (missing dependency, GNU extension, etc.),
+         fall back entirely to the pattern-based
+         ``extract_functions`` + ``BodyTranslator`` pipeline.
+    """
 
     def __init__(self, c_path: str, unit_name: str,
-                 form_unit: Optional[str] = None):
+                 form_unit: Optional[str] = None,
+                 included_units: list[str] = None,
+                 fake_include_dir: str = "/tmp/fake_libc_include",
+                 use_ast: bool = True):
         self.c_path = c_path
         self.unit_name = unit_name
         self.form_unit = form_unit  # name of the unit that owns form fields
+        self.included_units = list(included_units or [])
+        self.fake_include_dir = fake_include_dir
+        self.use_ast = use_ast
         self.stats = {
             "functions": 0, "globals": 0, "translated_stmts": 0,
             "todo_stmts": 0, "lines_in": 0, "lines_out": 0,
+            "ast_used": False,
         }
         # Collected TodoItems (as plain dicts) across all functions in
         # this file. Using dicts instead of dataclasses so JSON
@@ -1077,6 +1195,8 @@ class CFileTranslator:
         # Updated as the header is built; used to compute absolute output
         # line numbers for each TODO.
         self._header_line_count = 0
+        # AST analysis result (None if pycparser not used or failed)
+        self._ast_result = None
 
     # ------------------------------------------------------------------
     def translate(self) -> str:
@@ -1085,6 +1205,23 @@ class CFileTranslator:
         self.stats["lines_in"] = src.count("\n") + 1
         src_clean = strip_comments(src)
         src_clean, directives = strip_preprocessor(src_clean)
+
+        # ---- Try AST-based analysis first ----
+        if self.use_ast:
+            try:
+                from ast_translator import parse_with_ast
+                self._ast_result = parse_with_ast(
+                    self.c_path, self.unit_name,
+                    fake_include_dir=self.fake_include_dir,
+                    form_unit=self.form_unit,
+                    included_units=self.included_units,
+                )
+                if self._ast_result is not None:
+                    self.stats["ast_used"] = True
+            except Exception:
+                self._ast_result = None
+
+        # ---- Pattern-based fallback (always run for body translation) ----
         funcs, residual = extract_functions(src_clean)
         globals_list = extract_globals(residual)
 
@@ -1096,13 +1233,16 @@ class CFileTranslator:
         out.append("interface")
         out.append("")
         out.append("uses")
-        if self.form_unit and self.form_unit != self.unit_name:
-            out.append("  Classes, SysUtils, Forms, Controls, Graphics, Dialogs,")
-            out.append("  StdCtrls, ComCtrls, ExtCtrls, Buttons, Spin, Menus, LCLType,")
-            out.append(f"  {self.form_unit};")
-        else:
-            out.append("  Classes, SysUtils, Forms, Controls, Graphics, Dialogs,")
-            out.append("  StdCtrls, ComCtrls, ExtCtrls, Buttons, Spin, Menus, LCLType;")
+        base_units = ["Classes", "SysUtils", "Forms", "Controls",
+                      "Graphics", "Dialogs", "StdCtrls", "ComCtrls",
+                      "ExtCtrls", "Buttons", "Spin", "Menus", "LCLType"]
+        unit_list = base_units + self.included_units
+        if self.form_unit and self.form_unit != self.unit_name \
+                and self.form_unit not in unit_list:
+            unit_list.append(self.form_unit)
+        for i, u in enumerate(unit_list):
+            sep = "," if i < len(unit_list) - 1 else ";"
+            out.append(f"  {u}{sep}")
         out.append("")
         # Constants from #define
         defines = self._extract_defines(directives)
@@ -1117,12 +1257,27 @@ class CFileTranslator:
         out.append("  WORD  = Word;")
         out.append("  BYTE  = Byte;")
         out.append("")
-        # Globals as var block (interface section).
-        # Deduplicate by base name (without array brackets) to avoid
-        # "duplicate var" Pascal compile errors when the C source declares
-        # the same extern in multiple places (possibly with different
-        # array sizes - we keep the first declaration).
-        if globals_list:
+
+        # AST-derived typedefs (more accurate than pattern-based)
+        if self._ast_result is not None and self._ast_result.typedefs:
+            out.append("type")
+            for td in self._ast_result.typedefs:
+                out.append(td.pascal_decl)
+            out.append("")
+
+        # Globals: prefer AST-derived ones (more accurate types), fall
+        # back to pattern-extracted ones.
+        if self._ast_result is not None and self._ast_result.globals:
+            out.append("var")
+            seen_names: set[str] = set()
+            for g in self._ast_result.globals:
+                if g.name in seen_names:
+                    continue
+                seen_names.add(g.name)
+                out.append(f"  {g.name}: {g.pascal_type};")
+            out.append("")
+            self.stats["globals"] = len(seen_names)
+        elif globals_list:
             out.append("var")
             seen_names: set[str] = set()
             for g in globals_list:
@@ -1131,7 +1286,6 @@ class CFileTranslator:
                     name, init = self._split_name_init(name_init)
                     if not name:
                         continue
-                    # Compute base name (strip array suffix) for dedup
                     base_name = re.match(r"(\w+)", name)
                     if not base_name:
                         continue
@@ -1140,7 +1294,6 @@ class CFileTranslator:
                         continue
                     seen_names.add(base)
                     if "[" in name:
-                        # array global
                         m = re.match(r"(\w+)\s*\[([^\]]*)\]", name)
                         if m:
                             n = m.group(1)
@@ -1152,25 +1305,93 @@ class CFileTranslator:
                             continue
                     out.append(f"  {name}: {pas_type};")
             out.append("")
-        # Function prototypes
+            self.stats["globals"] = len(seen_names)
+
+        # Function prototypes: prefer AST-derived signatures
         out.append("// --- function declarations ---")
-        for fn in funcs:
-            sig = self._pascal_signature(fn, prototype=True)
-            if sig:
-                out.append(sig + ";")
-        out.append("")
+        if self._ast_result is not None and self._ast_result.functions:
+            for fn in self._ast_result.functions:
+                sig = self._ast_result._pascal_signature(fn, prototype=True)
+                if sig:
+                    out.append(sig + ";")
+            out.append("")
+            self.stats["functions"] = len(self._ast_result.functions)
+        else:
+            for fn in funcs:
+                sig = self._pascal_signature(fn, prototype=True)
+                if sig:
+                    out.append(sig + ";")
+            out.append("")
+            self.stats["functions"] = len(funcs)
         out.append("implementation")
         out.append("")
         # Function bodies
-        for fn in funcs:
-            body_lines = self._translate_function(fn)
-            out.extend(body_lines)
-            out.append("")
+        if self._ast_result is not None and self._ast_result.functions:
+            # Use AST function list with pattern-based bodies (Stage 1)
+            pattern_funcs_by_name = {fn.name: fn for fn in funcs}
+            for ast_fn in self._ast_result.functions:
+                if ast_fn.body_node is None:
+                    continue  # prototype only
+                sig = self._ast_result._pascal_signature(ast_fn, prototype=False)
+                if not sig:
+                    continue
+                out.append(sig + ";")
+                pat_fn = pattern_funcs_by_name.get(ast_fn.name)
+                body_translated: list[str] = []
+                local_decls: list[str] = []
+                # Use AST-based body translator (Stage 2) since we have
+                # the AST function with its body_node. This is more
+                # accurate than the pattern-based BodyTranslator.
+                try:
+                    from ast_translator import translate_body_with_ast
+                    body_offset = self._header_line_count + len(out) + 1
+                    ast_result = translate_body_with_ast(
+                        ast_fn, source_file=self.c_path, indent=2,
+                    )
+                    body_translated = ast_result["lines"]
+                    local_decls = ast_result["locals"]
+                    # Patch output_line in each todo with the correct offset
+                    for todo in ast_result["todos"]:
+                        todo["output_line"] += body_offset
+                    self.stats["translated_stmts"] += \
+                        ast_result["stats"]["translated_count"]
+                    self.stats["todo_stmts"] += \
+                        ast_result["stats"]["todo_count"]
+                    self.todos.extend(ast_result["todos"])
+                except Exception:
+                    # Fall back to pattern-based body if AST translation
+                    # fails for any reason.
+                    if pat_fn:
+                        body_offset = self._header_line_count + len(out) + 1
+                        translator = BodyTranslator(pat_fn, indent=2,
+                                                     source_file=self.c_path)
+                        translator._pas_line = body_offset
+                        body_translated = translator.translate()
+                        local_decls = translator.locals
+                        self.stats["translated_stmts"] += translator.translated_count
+                        self.stats["todo_stmts"] += translator.todo_count
+                        self.todos.extend(translator.todos)
+                if local_decls:
+                    out.append("var")
+                    out.extend(local_decls)
+                else:
+                    out.append("var")
+                    out.append("  // (no local variables detected)")
+                out.append("begin")
+                out.extend(body_translated)
+                if not body_translated:
+                    out.append("  // empty body")
+                out.append("end;")
+                out.append("")
+        else:
+            # Pattern-based bodies
+            for fn in funcs:
+                body_lines = self._translate_function(fn)
+                out.extend(body_lines)
+                out.append("")
         out.append("end.")
         text = "\n".join(out) + "\n"
         self.stats["lines_out"] = text.count("\n") + 1
-        self.stats["functions"] = len(funcs)
-        self.stats["globals"] = len(globals_list)
         return text
 
     # ------------------------------------------------------------------
@@ -1286,23 +1507,45 @@ class CFileTranslator:
 # ---------------------------------------------------------------------------
 def convert_c_file(c_path: str, out_dir: str,
                    unit_name: Optional[str] = None,
-                   form_unit: Optional[str] = None) -> dict:
-    """Convert one .c file to a .pas unit under ``out_dir``."""
+                   form_unit: Optional[str] = None,
+                   included_units: list[str] = None,
+                   fake_include_dir: Optional[str] = None,
+                   use_ast: bool = True) -> dict:
+    """Convert one .c file to a .pas unit under ``out_dir``.
+
+    Parameters
+    ----------
+    included_units
+        Pascal unit names (from local headers) to add to the uses clause.
+    fake_include_dir
+        Directory of stub libc/GTK headers for pycparser. If None, the
+        converter looks for ``/tmp/fake_libc_include`` and creates it
+        on first use by running ``gen_fake_includes.py``.
+    use_ast
+        If True (default), try pycparser for accurate signatures and
+        fall back to pattern-based translation on failure.
+    """
     if unit_name is None:
         unit_name = os.path.splitext(os.path.basename(c_path))[0].lower()
-        # Pascal unit identifiers cannot start with a digit
         if unit_name[0].isdigit():
             unit_name = "u" + unit_name
-    translator = CFileTranslator(c_path, unit_name, form_unit)
+    # Auto-create fake includes if needed
+    if fake_include_dir is None:
+        fake_include_dir = _ensure_fake_includes()
+    translator = CFileTranslator(c_path, unit_name, form_unit,
+                                  included_units=included_units,
+                                  fake_include_dir=fake_include_dir,
+                                  use_ast=use_ast)
     text = translator.translate()
     # Compute header line count: count newlines up to "implementation\n"
-    # and add 2 (the "implementation" line itself + blank after).
     impl_idx = text.find("\nimplementation\n")
     if impl_idx >= 0:
         translator._header_line_count = text[:impl_idx].count("\n") + 2
-    # Re-translate now that we know the header line count, so the
-    # TodoItem output_line fields are correct.
-    translator2 = CFileTranslator(c_path, unit_name, form_unit)
+    # Re-translate for accurate output_line in TodoItems
+    translator2 = CFileTranslator(c_path, unit_name, form_unit,
+                                   included_units=included_units,
+                                   fake_include_dir=fake_include_dir,
+                                   use_ast=use_ast)
     translator2._header_line_count = translator._header_line_count
     text = translator2.translate()
     os.makedirs(out_dir, exist_ok=True)
@@ -1480,14 +1723,20 @@ class HeaderTranslator:
 
         # Anything else: emit as TODO comments so the user can see what
         # was not handled. We collect a few leftover lines as a hint.
-        leftover = self._leftover_lines(src_no_pp)
-        for line in leftover[:30]:
-            out.append(f"  (* TODO gtk2laz: header line not translated: "
-                       f"{line.strip()[:120]} *)")
+        # Try to find the source line for each leftover line so we can
+        # include the original C context.
+        leftover = self._leftover_lines_with_lines(src_no_pp)
+        for line_text, src_line in leftover[:30]:
+            # Multi-line TODO comment with original C source
+            out.append(f"  (* TODO gtk2laz: header line not translated")
+            out.append(f"    Source: {self.h_path}:{src_line}")
+            out.append(f"    Original C:")
+            out.append(f"      {line_text.strip()[:200]}")
+            out.append(f"  *)")
             self.todos.append({
                 "source_file": self.h_path,
-                "source_line": 0,
-                "source_text": line.strip()[:200],
+                "source_line": src_line,
+                "source_text": line_text.strip()[:200],
                 "output_file": "",
                 "output_line": 0,
                 "reason": "header line not translated",
@@ -1765,6 +2014,31 @@ class HeaderTranslator:
             out.append(stripped)
         return out
 
+    def _leftover_lines_with_lines(self, src: str) -> list[tuple[str, int]]:
+        """Like ``_leftover_lines`` but also returns the 1-based source
+        line number for each leftover line, so we can emit accurate
+        ``Source: <file>:<line>`` references in TODO comments.
+        """
+        out: list[tuple[str, int]] = []
+        for i, line in enumerate(src.splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith("#"):
+                continue
+            if stripped.startswith("typedef"):
+                continue
+            if stripped.startswith("extern"):
+                continue
+            if re.match(r"^[\w\s\*]+\s+\w+\s*\([^;]*\)\s*;", stripped):
+                continue
+            if stripped in ("}", "};"):
+                continue
+            if re.match(r"^[\w\s\*]+\s+\w+(\s*\[[^\]]*\])?\s*;", stripped):
+                continue
+            out.append((stripped, i))
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Top-level entry for headers
@@ -1795,3 +2069,44 @@ def convert_header_file(h_path: str, out_dir: str,
         "stats": translator.stats,
         "todos": translator.todos,
     }
+
+
+# ---------------------------------------------------------------------------
+# Fake include management
+# ---------------------------------------------------------------------------
+_FAKE_INCLUDE_DIR = "/tmp/fake_libc_include"
+_FAKE_INCLUDES_READY = False
+
+
+def _ensure_fake_includes() -> str:
+    """Make sure the fake libc/GTK stub headers exist; return their dir.
+
+    On first call, runs the gen_fake_includes.py script (which is
+    shipped alongside the gtk2laz modules) to generate stub headers in
+    /tmp/fake_libc_include. Subsequent calls return immediately.
+    """
+    global _FAKE_INCLUDES_READY
+    if _FAKE_INCLUDES_READY:
+        return _FAKE_INCLUDE_DIR
+    # Check if dir already populated
+    sentinel = os.path.join(_FAKE_INCLUDE_DIR, "gtk", "gtk.h")
+    if os.path.isfile(sentinel):
+        _FAKE_INCLUDES_READY = True
+        return _FAKE_INCLUDE_DIR
+    # Generate by importing the gen_fake_includes module (works both in
+    # source layout and under PyInstaller, since gen_fake_includes.py is
+    # bundled as a data file).
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        meipass = getattr(sys, "_MEIPASS", None)
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        if meipass and meipass not in sys.path:
+            sys.path.insert(0, meipass)
+        import gen_fake_includes
+        gen_fake_includes.generate(_FAKE_INCLUDE_DIR)
+        if os.path.isfile(sentinel):
+            _FAKE_INCLUDES_READY = True
+    except Exception:
+        _FAKE_INCLUDES_READY = False
+    return _FAKE_INCLUDE_DIR

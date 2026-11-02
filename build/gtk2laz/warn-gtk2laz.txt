@@ -21,6 +21,7 @@ excluded module named _frozen_importlib - imported by importlib (optional), impo
 missing module named 'collections.abc' - imported by traceback (top-level), typing (top-level), inspect (top-level), logging (top-level), importlib.resources.readers (top-level), selectors (top-level), tracemalloc (top-level), xml.etree.ElementTree (top-level), http.client (top-level)
 missing module named posix - imported by os (conditional, optional), posixpath (optional), shutil (conditional), importlib._bootstrap_external (conditional)
 missing module named resource - imported by posix (top-level)
+missing module named pycparser - imported by ast_translator (delayed, optional), E:\dev\gtk2laz\gtk2laz.py (top-level)
 missing module named _posixsubprocess - imported by subprocess (conditional)
 missing module named fcntl - imported by subprocess (optional)
 missing module named _scproxy - imported by urllib.request (conditional)

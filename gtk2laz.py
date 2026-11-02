@@ -107,73 +107,14 @@ def convert_c_file_with_includes(c_path: str, out_dir: str,
     """Convert a .c file and add the given header-derived unit names to
     the generated unit's ``uses`` clause.
 
-    This is a thin wrapper around ``c_parser.convert_c_file`` that
-    post-processes the generated .pas file to inject the extra ``uses``
-    entries. We do it as a post-pass rather than threading the parameter
-    through the translator to keep ``CFileTranslator`` simple.
+    This is now a thin wrapper around ``c_parser.convert_c_file`` which
+    itself accepts ``included_units`` directly (and also tries the
+    pycparser-based AST translator for accurate signatures).
     """
-    result = convert_c_file(c_path, out_dir,
-                             unit_name=unit_name, form_unit=form_unit)
-    if not included_units:
-        return result
-    # Read back the generated file and inject the extra uses entries.
-    out_path = result["out_path"]
-    with open(out_path, "r", encoding="utf-8") as f:
-        text = f.read()
-    # Find the uses clause. The translator emits one of:
-    #   uses
-    #     Classes, ..., LCLType;
-    #   uses
-    #     Classes, ..., LCLType,
-    #     mainform;
-    # We append our header units before the semicolon that ends the clause.
-    # Strategy: locate the line that ends the uses clause (the one ending
-    # with ';' before 'type'/'const'/'var') and insert our units there.
-    lines = text.split("\n")
-    out_lines = []
-    in_uses = False
-    injected = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("uses"):
-            in_uses = True
-            out_lines.append(line)
-            continue
-        if in_uses and not injected:
-            # If this line ends the uses clause (ends with ';'), inject.
-            if stripped.endswith(";") and not stripped.endswith(","):
-                # Strip the trailing ';' and replace with ',\n  <units>;'
-                # But only if the line has content (not just ';')
-                if stripped == ";":
-                    # Empty uses terminator (shouldn't happen) - replace
-                    indent = line[:len(line) - len(stripped)]
-                    for i, u in enumerate(included_units):
-                        sep = "," if i < len(included_units) - 1 else ";"
-                        out_lines.append(f"{indent}  {u}{sep}")
-                    injected = True
-                    continue
-                # Replace the trailing ';' with ',\n  <units>;'
-                indent = "  "
-                # Get the indent of the current line (after "uses" block)
-                # which is typically 2 spaces.
-                new_line = line.rstrip()
-                # Remove trailing ';'
-                new_line = new_line[:-1].rstrip() + ","
-                out_lines.append(new_line)
-                for i, u in enumerate(included_units):
-                    sep = "," if i < len(included_units) - 1 else ";"
-                    out_lines.append(f"{indent}{u}{sep}")
-                injected = True
-                in_uses = False
-                continue
-            # Otherwise just copy the line as-is
-            out_lines.append(line)
-            continue
-        out_lines.append(line)
-    new_text = "\n".join(out_lines)
-    with open(out_path, "w", encoding="utf-8") as f:
-        f.write(new_text)
-    return result
+    return convert_c_file(c_path, out_dir,
+                           unit_name=unit_name,
+                           form_unit=form_unit,
+                           included_units=included_units)
 
 
 def discover(root: str) -> Project:
@@ -836,6 +777,17 @@ def scan_todos_in_project(project_dir: str) -> list[dict]:
     accurate source-file and source-line info). Falls back to scanning
     the .pas files for ``(* TODO gtk2laz: ... *)`` markers when the
     sidecar is missing.
+
+    The new multi-line TODO format is::
+
+        (* TODO gtk2laz: <reason>
+           Source: <file>:<line>
+           Original C:
+             <code>
+        *)
+
+    The scanner recognises both the new multi-line format and the
+    legacy single-line format for backward compatibility.
     """
     import json
     import re
@@ -847,7 +799,16 @@ def scan_todos_in_project(project_dir: str) -> list[dict]:
         except (OSError, ValueError):
             pass
     # Fallback: scan .pas files for TODO markers.
-    todo_re = re.compile(
+    # New multi-line format: (* TODO gtk2laz: <reason>\n ... Source: ... \n ... Original C: ... *)
+    # Old single-line format: (* TODO gtk2laz: <reason>: <text> *)
+    multi_re = re.compile(
+        r"\(\* TODO gtk2laz: (?P<reason>[^\n*]+)\n"
+        r"\s*Source:\s*(?P<src>[^:\n]+):(?P<line>\d+)\n"
+        r"(?:\s*Original C:\n(?P<code>(?:\s+.+\n)+))?"
+        r"\s*\*\)",
+        re.MULTILINE,
+    )
+    single_re = re.compile(
         r"\(\* TODO gtk2laz: (?P<reason>[^:]+):\s*(?P<text>.*?)\s*\*\)"
     )
     out: list[dict] = []
@@ -857,12 +818,46 @@ def scan_todos_in_project(project_dir: str) -> list[dict]:
         path = os.path.join(project_dir, fname)
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+                content = f.read()
         except OSError:
             continue
+        lines = content.split("\n")
+        # Multi-line format
+        for m in multi_re.finditer(content):
+            # Compute the line number where the TODO starts
+            start_pos = m.start()
+            line_num = content[:start_pos].count("\n") + 1
+            code_block = ""
+            if m.group("code"):
+                # Strip the leading indentation from each code line
+                code_lines = []
+                for cl in m.group("code").split("\n"):
+                    code_lines.append(cl.strip())
+                code_block = "\n".join(l for l in code_lines if l)
+            out.append({
+                "source_file":  m.group("src").strip(),
+                "source_line":  int(m.group("line") or 0),
+                "source_text":  code_block or m.group("reason").strip(),
+                "output_file":  path,
+                "output_line":  line_num,
+                "reason":       m.group("reason").strip(),
+                "function":     "",
+            })
+        # Single-line (legacy) format - only if not already matched
         for i, line in enumerate(lines, start=1):
-            m = todo_re.search(line)
+            m = single_re.search(line)
             if not m:
+                continue
+            # Skip if this line is part of a multi-line TODO we already
+            # captured (heuristic: check if line_num is within any
+            # multi-line match range)
+            already = False
+            for existing in out:
+                if existing["output_file"] == path:
+                    if existing["output_line"] <= i <= existing["output_line"] + 10:
+                        already = True
+                        break
+            if already:
                 continue
             out.append({
                 "source_file":  "",
