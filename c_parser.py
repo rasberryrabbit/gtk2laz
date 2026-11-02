@@ -3231,6 +3231,13 @@ class CFileTranslator:
         else:
             out.append("")
 
+        # Inline struct types from extern declarations
+        # (e.g. ``extern struct var { ... } variables[0x200];``)
+        if hasattr(self, '_inline_types') and self._inline_types:
+            for t in self._inline_types:
+                out.append(t)
+            out.append("")
+
         # AST-derived typedefs (more accurate than pattern-based)
         if self._ast_result is not None and self._ast_result.typedefs:
             out.append("type")
@@ -3711,9 +3718,6 @@ class HeaderTranslator:
         typedefs, consumed_spans = self._extract_typedefs(src_no_pp)
         self.extracted_types = typedefs
         if typedefs:
-            # The ``type`` keyword was already emitted above (with DWORD,
-            # WORD, BYTE). We append the struct/enum/typedef declarations
-            # directly into that same type block.
             for t in typedefs:
                 out.append(t)
             out.append("")
@@ -3722,8 +3726,18 @@ class HeaderTranslator:
             out.append("")
 
         # 3) extern globals -> var
+        #    Call _extract_externs BEFORE emitting inline types so that
+        #    _inline_types (from inline struct externs) is populated.
         externs = self._extract_externs(src_no_pp)
         self.extracted_externs = externs
+
+        # Inline struct types from extern declarations
+        # (e.g. ``extern struct var { ... } variables[0x200];``)
+        if hasattr(self, '_inline_types') and self._inline_types:
+            for t in self._inline_types:
+                out.append(t)
+            out.append("")
+
         if externs:
             out.append("var")
             seen = set()
@@ -4070,9 +4084,66 @@ class HeaderTranslator:
     def _extract_externs(self, src: str) -> list[tuple[str, str]]:
         """Extract ``extern TYPE NAME;`` declarations.
 
+        Also handles inline struct definitions:
+        ``extern struct TAG { fields... } NAME[SIZE];``
+
         Returns list of (name, pascal_type).
         """
         out: list[tuple[str, str]] = []
+
+        # ---- First pass: handle inline struct extern declarations ----
+        # Pattern: extern struct TAG { ... } NAME[SIZE];  or
+        #          extern struct TAG { ... } NAME;
+        # We extract the struct as a Pascal record type and the variable
+        # as an array/variable of that type.
+        for m in re.finditer(
+            r"extern\s+struct\s+(\w+)\s*\{([^}]*)\}\s*"
+            r"(\w+)\s*(?:\[([^\]]*)\])?\s*;",
+            src, re.DOTALL,
+        ):
+            tag = m.group(1)
+            body = m.group(2)
+            var_name = m.group(3)
+            arr_size = m.group(4)
+            # Create a Pascal record type for this inline struct
+            pas_type_name = self._pascalize_type_name(tag)
+            # Emit the type declaration via _extract_typedefs-like logic
+            # by adding it to the output (we piggyback on the typedef
+            # infrastructure by emitting the record here).
+            # We store it as a special extern with a type prefix.
+            fields = self._parse_struct_fields(body)
+            if fields:
+                # Build the record type string
+                type_decl = [f"  {pas_type_name} = record"]
+                seen = set()
+                for fname, ftype in fields:
+                    if fname in seen:
+                        continue
+                    seen.add(fname)
+                    type_decl.append(
+                        f"    {pascalify_name(fname)}: {ftype};"
+                    )
+                type_decl.append("  end;")
+                # Store the type declaration so it can be emitted
+                if not hasattr(self, '_inline_types'):
+                    self._inline_types = []
+                self._inline_types.extend(type_decl)
+            # Determine the variable's Pascal type
+            if arr_size:
+                # Convert hex literal in array size
+                arr_size_pas = arr_size
+                m_hex = re.match(r"^0[xX]([0-9A-Fa-f]+)$", arr_size.strip())
+                if m_hex:
+                    arr_size_pas = "$" + m_hex.group(1)
+                out.append((var_name, f"array[0..{arr_size_pas}-1] of {pas_type_name}"))
+            else:
+                out.append((var_name, pas_type_name))
+            # Mark this span as consumed so _leftover_lines skips it
+            if not hasattr(self, '_inline_consumed'):
+                self._inline_consumed = []
+            self._inline_consumed.append((m.start(), m.end()))
+
+        # ---- Second pass: regular extern declarations ----
         # extern TYPE NAME;  or  extern TYPE *NAME;  or  extern TYPE NAME[N];
         for m in re.finditer(
             r"extern\s+(?P<type>(?:const\s+|volatile\s+)*"
@@ -4080,6 +4151,14 @@ class HeaderTranslator:
             r"(?P<decl>[^;]+);",
             src,
         ):
+            # Skip if already consumed by inline struct pass
+            if hasattr(self, '_inline_consumed'):
+                if any(m.start() >= cs and m.end() <= ce
+                       for cs, ce in self._inline_consumed):
+                    continue
+            # Skip if this is an inline struct (handled above)
+            if 'struct' in m.group(0).split('{')[0] and '{' in m.group(0):
+                continue
             ptype = c_type_to_pascal(m.group("type").strip())
             decl = m.group("decl").strip()
             # Multiple declarators separated by commas
