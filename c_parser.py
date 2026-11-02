@@ -524,6 +524,68 @@ class BodyTranslator:
         n = len(src)
         while i < n:
             ch = src[i]
+            # Check for 'do' keyword — do-while must be kept as one
+            # statement so the 'while' part isn't split off by the ';'
+            # inside or after the do-body.
+            if ch == "d" and src[i:i+2] == "do" and \
+                    i + 2 < n and src[i+2] in " \t\n{" and \
+                    (i == 0 or not (src[i-1].isalnum() or src[i-1] == "_")):
+                # Found 'do' keyword — find the matching 'while(...);' to
+                # determine the end of the do-while statement.
+                # Strategy: find 'while' at the top level (depth 0), then
+                # find its matching ')' and the trailing ';'.
+                j = i + 2  # skip "do"
+                d_depth = 0
+                while_end = -1
+                while j < n:
+                    c2 = src[j]
+                    if c2 in "{(":
+                        d_depth += 1
+                    elif c2 in "})":
+                        d_depth -= 1
+                    if d_depth == 0 and src[j:j+5] == "while" and \
+                            (j == 0 or not (src[j-1].isalnum() or src[j-1] == "_")):
+                        while_end = j
+                        break
+                    j += 1
+                if while_end < 0:
+                    # No 'while' found — treat as normal text
+                    cur.append(ch)
+                    i += 1
+                    continue
+                # Found 'while' — find its matching ')'
+                wparen = src.find("(", while_end + 5)
+                if wparen < 0:
+                    cur.append(ch)
+                    i += 1
+                    continue
+                wdepth = 1
+                k = wparen + 1
+                while k < n and wdepth > 0:
+                    if src[k] == "(":
+                        wdepth += 1
+                    elif src[k] == ")":
+                        wdepth -= 1
+                    k += 1
+                if wdepth != 0:
+                    cur.append(ch)
+                    i += 1
+                    continue
+                # k is past the ')' — look for ';'
+                while k < n and src[k] in " \t\n":
+                    k += 1
+                if k < n and src[k] == ";":
+                    # Found the end of do-while — append everything
+                    # from 'do' to ';' (inclusive) as one statement.
+                    cur.append(src[i:k+1])
+                    i = k + 1
+                    out.append("".join(cur))
+                    cur = []
+                    continue
+                else:
+                    cur.append(ch)
+                    i += 1
+                    continue
             if ch == "{":
                 depth += 1
                 cur.append(ch)
@@ -1067,6 +1129,12 @@ class BodyTranslator:
             self.indent += 1
             if stmt:
                 self._translate_statement(stmt.strip())
+            else:
+                # Empty body (e.g. ``if (a) ;``) — emit an empty
+                # begin/end block so Pascal has a valid statement
+                # after ``then`` / ``else``.
+                self._emit(f"{pad}begin")
+                self._emit(f"{pad}{end_token}")
             self.indent -= 1
             # In Pascal, single-statement if body doesn't need begin/end,
             # but we need to handle the semicolon correctly for else.
@@ -1660,20 +1728,59 @@ class BodyTranslator:
         self._emit(f"{pad}end;")
 
     def _translate_do(self, s: str) -> None:
+        """C do-while: ``do body while (cond);`` -> Pascal ``repeat body until not (cond);``
+
+        Handles:
+          * Brace body: ``do { ... } while (cond);``
+          * Single-statement body: ``do b++; while (cond);``
+          * Empty body: ``do ; while (cond);`` or ``do {} while (cond);``
+        """
         pad = self._pad()
-        body, tail = self._extract_block(s[2:].lstrip())
+        rest = s[2:].lstrip()  # skip "do"
+        # Try brace body first
+        if rest.startswith("{"):
+            body, tail = self._extract_block(rest)
+            body = body.strip()
+        else:
+            # Single-statement or empty body: extract until "while"
+            # Find the "while" keyword that ends the do-body
+            # We need to find "while" that is at the top level (not inside
+            # a nested expression). Walk through the string tracking
+            # paren/brace depth.
+            depth = 0
+            i = 0
+            while_idx = -1
+            while i < len(rest):
+                ch = rest[i]
+                if ch in "{(":
+                    depth += 1
+                elif ch in "})":
+                    depth -= 1
+                elif depth == 0 and rest[i:i+5] == "while" and \
+                        (i == 0 or rest[i-1] in " \t\n}"):
+                    while_idx = i
+                    break
+                i += 1
+            if while_idx < 0:
+                self._emit_todo(s, "do-while without while")
+                return
+            body = rest[:while_idx].strip()
+            tail = rest[while_idx:]
         m = re.match(r"\s*while\s*\((.*?)\)\s*;?", tail, re.DOTALL)
-        if m:
-            cond = self._translate_cond(m.group(1))
-            self._emit(f"{pad}repeat")
-            self.indent += 1
+        if not m:
+            self._emit_todo(s, "do-while without while")
+            return
+        cond = self._translate_cond(m.group(1))
+        self._emit(f"{pad}repeat")
+        self.indent += 1
+        if body:
             for sub in self._split_statements(body):
                 if sub.strip():
                     self._translate_statement(sub.strip())
-            self.indent -= 1
-            self._emit(f"{pad}until not ({cond});")
-        else:
-            self._emit_todo(s, "do-while without while")
+        # Empty body is fine for Pascal repeat/until — it just loops
+        # with no statements, which is valid.
+        self.indent -= 1
+        self._emit(f"{pad}until not ({cond});")
 
     def _translate_switch(self, s: str) -> None:
         pad = self._pad()
