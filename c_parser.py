@@ -481,13 +481,22 @@ class BodyTranslator:
         # lines 1..N before us; we update _pas_line as we go.
         self._pas_line = 1
         self.todos: list[TodoItem] = []
+        # Name mapping: C identifier -> Pascal identifier.
+        # When a C variable/function name is a Pascal reserved word,
+        # pascalify_name appends ``_``. We record this mapping so that
+        # references to the variable in expressions can be updated too.
+        self._name_map: dict[str, str] = {}
         # Extra type names that should be treated as valid C types when
-        # deciding whether a statement is a local declaration. Populated
-        # from typedefs discovered in the same translation unit (set by
-        # the caller via ``set_known_types``). Defaults to empty — the
-        # module-level ``_KNOWN_TYPEDEFS`` already covers the common
-        # Windows/GLib/stdint typedefs.
+        # deciding whether a statement is a local declaration.
         self._extra_known_types: set[str] = set()
+
+    def _pascalify(self, name: str) -> str:
+        """Like pascalify_name, but also records the C→Pascal name
+        mapping so references in expressions can be updated."""
+        pas = pascalify_name(name)
+        if pas != name:
+            self._name_map[name] = pas
+        return pas
 
     # ------------------------------------------------------------------
     def translate(self) -> list[str]:
@@ -1926,7 +1935,7 @@ class BodyTranslator:
             # Handle array
             m_arr = re.match(r"\*?\s*(\w+)\s*\[([^\]]*)\]\s*(?:=\s*(.*))?$", d)
             if m_arr:
-                name = pascalify_name(m_arr.group(1))
+                name = self._pascalify(m_arr.group(1))
                 size = m_arr.group(2).strip()
                 init = m_arr.group(3)
                 if not size:
@@ -1979,7 +1988,7 @@ class BodyTranslator:
                 continue
             m_init = re.match(r"(\w+)\s*=\s*(.+)$", d, re.DOTALL)
             if m_init:
-                name = pascalify_name(m_init.group(1))
+                name = self._pascalify(m_init.group(1))
                 val = self._translate_expr(m_init.group(2).strip())
                 self._emit_local(f"  {name}: {pas_type};")
                 pad = self._pad()
@@ -1988,7 +1997,7 @@ class BodyTranslator:
             # Pointer with optional initializer: ``*pd = &a``
             m_ptr_init = re.match(r"\*\s*(\w+)\s*=\s*(.+)$", d, re.DOTALL)
             if m_ptr_init:
-                name = pascalify_name(m_ptr_init.group(1))
+                name = self._pascalify(m_ptr_init.group(1))
                 val = self._translate_expr(m_ptr_init.group(2).strip())
                 self._emit_local(f"  {name}: {pas_type};")
                 pad = self._pad()
@@ -1996,10 +2005,10 @@ class BodyTranslator:
                 continue
             # Pointer (no initializer)
             if d.startswith("*"):
-                name = pascalify_name(d.lstrip("*").strip())
+                name = self._pascalify(d.lstrip("*").strip())
                 self._emit_local(f"  {name}: {pas_type};")
                 continue
-            self._emit_local(f"  {pascalify_name(d)}: {pas_type};")
+            self._emit_local(f"  {self._pascalify(d)}: {pas_type};")
 
     @staticmethod
     def _translate_c_string(inner: str) -> str:
@@ -2367,6 +2376,12 @@ class BodyTranslator:
         m = re.match(r"^0[xX]([0-9A-Fa-f]+)[uUlL]*$", expr)
         if m:
             return f"${m.group(1)}"
+        # ---- Identifier name remapping ----
+        # If the expression is a simple identifier that was remapped
+        # (because it's a Pascal reserved word), return the remapped name.
+        # e.g. C variable ``type`` -> Pascal ``type_``
+        if re.match(r"^\w+$", expr) and expr in self._name_map:
+            return self._name_map[expr]
         # ---- Logical operators (&&, ||) — wrap each side in parens ----
         # Pascal's ``and``/``or`` are bitwise by default and have higher
         # precedence than comparison operators (unlike C, where ``&&`` has
@@ -2488,7 +2503,54 @@ class BodyTranslator:
         result = re.sub(r"--(\w+)", r"Dec(\1)", result)
         result = re.sub(r"(\w+)\+\+", r"Inc(\1)", result)
         result = re.sub(r"(\w+)--", r"Dec(\1)", result)
+        # ---- Apply identifier name remapping ----
+        # Replace any C identifier that was remapped (because it's a Pascal
+        # reserved word) with its Pascal-safe equivalent.
+        # e.g. ``type`` -> ``type_``, ``file`` -> ``file_``
+        # We use word boundaries so we don't replace substrings.
+        # Skip string literals (single/double quoted).
+        if self._name_map:
+            result = self._apply_name_map(result)
         return result
+
+    def _apply_name_map(self, s: str) -> str:
+        """Replace C identifiers with their Pascal-safe equivalents,
+        skipping string literals."""
+        # Build a regex that matches any of the remapped names as whole words
+        names = sorted(self._name_map.keys(), key=len, reverse=True)
+        if not names:
+            return s
+        pattern = re.compile(
+            r"\b(" + "|".join(re.escape(n) for n in names) + r")\b"
+        )
+        out: list[str] = []
+        i = 0
+        n = len(s)
+        in_str = False
+        str_char = ""
+        while i < n:
+            ch = s[i]
+            if in_str:
+                out.append(ch)
+                if ch == str_char and (i == 0 or s[i-1] != "\\"):
+                    in_str = False
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_str = True
+                str_char = ch
+                out.append(ch)
+                i += 1
+                continue
+            # Try to match a remapped name at this position
+            m = pattern.match(s, i)
+            if m:
+                out.append(self._name_map[m.group(1)])
+                i = m.end()
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
 
     @staticmethod
     def _convert_hex_literals(s: str) -> str:
