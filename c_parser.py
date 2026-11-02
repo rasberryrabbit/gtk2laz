@@ -945,13 +945,36 @@ class BodyTranslator:
         # keyword (int, char, etc.) or a known typedef. This prevents
         # statements like ``sum += i`` from being mis-parsed as a
         # declaration of variable ``+= i`` with type ``sum``.
+        #
+        # First, strip leading C storage class specifiers (auto, register,
+        # static, extern, inline, restrict, volatile, __restrict, etc.)
+        # so the actual type keyword becomes the first word.
+        # ``auto int b = 5;`` -> ``int b = 5;`` (then parsed normally)
+        s_decl = re.sub(
+            r"^(?:const\s+|static\s+|auto\s+|register\s+|extern\s+|"
+            r"inline\s+|restrict\s+|volatile\s+|__restrict\s+|"
+            r"__inline\s+|__restrict__\s+|__inline__\s+|"
+            r"__attribute__\s*\([^)]*\)\s+)*",
+            "",
+            s,
+        ).strip()
         m = re.match(
-            r"^(?P<type>(?:const\s+|static\s+|unsigned\s+|signed\s+|volatile\s+)*"
+            r"^(?P<type>(?:const\s+|unsigned\s+|signed\s+|volatile\s+)*"
             r"[\w]+(?:\s+\w+)*\s*\**)\s+(?P<rest>.+)$",
-            s, re.DOTALL,
+            s_decl, re.DOTALL,
         )
         if m and not s.startswith("("):
             type_str = m.group("type").strip()
+            rest = m.group("rest").strip()
+            # If rest starts with '=' (e.g. ``int b = 5`` was parsed as
+            # type="int b", rest="= 5"), the last word of type_str is
+            # actually the variable name. Move it to rest.
+            if rest.startswith("="):
+                parts = type_str.rsplit(None, 1)
+                if len(parts) == 2:
+                    var_name = parts[1]
+                    type_str = parts[0]
+                    rest = var_name + " " + rest
             # Check if the first word is a C type keyword or known typedef.
             # Strip trailing ``*`` (pointer) so that ``GtkTextTag*`` is
             # recognised as the typedef ``GtkTextTag``.
@@ -962,7 +985,7 @@ class BodyTranslator:
                     or first_word_stripped in _KNOWN_TYPEDEFS \
                     or first_word in self._extra_known_types \
                     or first_word_stripped in self._extra_known_types:
-                self._translate_local_decl(type_str, m.group("rest"))
+                self._translate_local_decl(type_str, rest)
                 return
             # If not a known type, fall through to assignment/call handling.
             # This is important so that ``sum += i`` is handled as an
@@ -1860,15 +1883,48 @@ class BodyTranslator:
 
     # ------------------------------------------------------------------
     def _translate_local_decl(self, type_str: str, rest: str) -> None:
-        pas_type = c_type_to_pascal(type_str.strip())
+        # Strip C storage class specifiers (auto, register, static, extern,
+        # inline, restrict, volatile, __restrict, etc.) — Pascal doesn't
+        # have these; they are C-only concepts.
+        type_clean = type_str.strip()
+        type_clean = re.sub(
+            r"\b(auto|register|static|extern|inline|restrict|volatile"
+            r"|__restrict|__restrict__|__inline|__inline__|__attribute__"
+            r"\s*\([^)]*\))\s+",
+            "",
+            type_clean,
+        ).strip()
+        # In C, ``*`` can appear on the type or on individual declarators:
+        #   ``int* a, b;``  — a is ``int*``, b is ``int`` (NOT ``int*``)
+        #   ``int *c, d;``  — c is ``int*``, d is ``int``
+        #   ``int *e, *f;`` — both are ``int*``
+        # C's rule: the ``*`` on the type applies to the FIRST declarator
+        # only; subsequent declarators need their own ``*``.
+        base_type = type_clean.replace("*", "").strip()
+        type_had_star = "*" in type_clean
+        pas_type_base = c_type_to_pascal(base_type)
+        pas_type_ptr = c_type_to_pascal(base_type + " *")
         # rest may be: "x = 5, y = 6" or "x[10]" etc.
         declarators = _split_top_level(rest.rstrip(";"))
+        first_decl = True
         for d in declarators:
             d = d.strip()
             if not d:
                 continue
+            # Determine if this declarator is a pointer.
+            # A declarator is a pointer if:
+            #   - it starts with its own ``*`` (e.g. ``*c``), OR
+            #   - the type had ``*`` AND this is the first declarator
+            #     AND the declarator doesn't start with ``*``
+            #     (e.g. ``int* a`` — a is pointer because of the type's ``*``)
+            is_ptr = d.startswith("*")
+            if not is_ptr and type_had_star and first_decl:
+                is_ptr = True
+            first_decl = False
+            # Determine the Pascal type for this declarator
+            pas_type = pas_type_ptr if is_ptr else pas_type_base
             # Handle array
-            m_arr = re.match(r"(\w+)\s*\[([^\]]*)\]\s*(?:=\s*(.*))?$", d)
+            m_arr = re.match(r"\*?\s*(\w+)\s*\[([^\]]*)\]\s*(?:=\s*(.*))?$", d)
             if m_arr:
                 name = pascalify_name(m_arr.group(1))
                 size = m_arr.group(2).strip()
@@ -1929,7 +1985,16 @@ class BodyTranslator:
                 pad = self._pad()
                 self._emit(f"{pad}{name} := {val};")
                 continue
-            # Pointer
+            # Pointer with optional initializer: ``*pd = &a``
+            m_ptr_init = re.match(r"\*\s*(\w+)\s*=\s*(.+)$", d, re.DOTALL)
+            if m_ptr_init:
+                name = pascalify_name(m_ptr_init.group(1))
+                val = self._translate_expr(m_ptr_init.group(2).strip())
+                self._emit_local(f"  {name}: {pas_type};")
+                pad = self._pad()
+                self._emit(f"{pad}{name} := {val};")
+                continue
+            # Pointer (no initializer)
             if d.startswith("*"):
                 name = pascalify_name(d.lstrip("*").strip())
                 self._emit_local(f"  {name}: {pas_type};")

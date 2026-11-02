@@ -359,15 +359,25 @@ def lookup_signal(gtk_signal: str):
 C_TYPE_MAP = {
     "void":           "",
     "int":            "Integer",
+    "signed":         "Integer",
+    "signed int":     "Integer",
     "unsigned":       "Cardinal",
     "unsigned int":   "Cardinal",
     "long":           "LongInt",
     "long int":       "LongInt",
+    "signed long":    "LongInt",
+    "signed long int":"LongInt",
     "unsigned long":  "DWORD",
+    "unsigned long int":"DWORD",
     "long long":      "Int64",
+    "long long int":  "Int64",
+    "unsigned long long": "QWord",
     "short":          "SmallInt",
     "short int":      "SmallInt",
+    "signed short":   "SmallInt",
+    "signed short int":"SmallInt",
     "unsigned short": "Word",
+    "unsigned short int":"Word",
     "char":           "Char",
     "unsigned char":  "Byte",
     "signed char":    "ShortInt",
@@ -423,6 +433,12 @@ C_TYPE_MAP = {
     "GCallback":      "TMethod",
     "GdkPixbuf":      "TPicture",
     "GdkScreen":      "TObject",
+    # Lowercase aliases for common typedef-style types
+    "byte":           "Byte",
+    "word":           "Word",
+    "dword":          "DWORD",
+    "boolean":        "Boolean",
+    "boolean_t":      "Boolean",
 }
 
 
@@ -471,12 +487,31 @@ def c_type_to_pascal(c_type: str) -> str:
             else:
                 pas = "T" + t
     if is_ptr:
-        if pas in ("Char",):
-            return "PChar"
-        if pas == "Byte":
-            return "PByte"
-        if pas in ("Integer", "Cardinal", "LongInt", "Word"):
-            return "^" + pas
+        # Use Pascal pointer-type conventions (P-prefix) instead of ``^T``
+        # for built-in types. Pascal/FPC defines these pointer types:
+        #   PInteger, PCardinal, PLongInt, PWord, PByte, PChar, etc.
+        # For custom types, use ``^T<Type>`` (pointer to record).
+        _PTR_TYPE_MAP = {
+            "Char":          "PChar",
+            "Byte":          "PByte",
+            "Integer":       "PInteger",
+            "Cardinal":      "PCardinal",
+            "LongInt":       "PLongInt",
+            "Word":          "PWord",
+            "SmallInt":      "PSmallInt",
+            "ShortInt":      "PShortInt",
+            "Int64":         "PInt64",
+            "QWord":         "PQWord",
+            "Double":        "PDouble",
+            "Single":        "PSingle",
+            "Extended":      "PExtended",
+            "Boolean":       "PBoolean",
+            "DWORD":         "PDWORD",
+            "Pointer":       "Pointer",
+            "TextFile":      "^TextFile",
+        }
+        if pas in _PTR_TYPE_MAP:
+            return _PTR_TYPE_MAP[pas]
         return "^" + pas
     return pas
 
