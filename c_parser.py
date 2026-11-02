@@ -3155,6 +3155,35 @@ class CFileTranslator:
         # AST analysis result (None if pycparser not used or failed)
         self._ast_result = None
 
+    @staticmethod
+    def _parse_struct_fields_c(body: str) -> list[tuple[str, str]]:
+        """Parse struct body into (field, type) tuples.
+        Same logic as HeaderTranslator._parse_struct_fields."""
+        out: list[tuple[str, str]] = []
+        for decl in _split_top_level(body, ";"):
+            decl = decl.strip()
+            if not decl:
+                continue
+            decl = re.sub(r":\s*\d+", "", decl).strip()  # bitfields
+            if not decl:
+                continue
+            m = re.match(
+                r"^(?P<type>(?:const\s+|unsigned\s+|signed\s+|volatile\s+)*"
+                r"[\w]+(?:\s+\w+)*\s*\**)\s+(?P<name>\w+)\s*"
+                r"(?:\[(?P<arr>[^\]]*)\])?\s*$",
+                decl, re.DOTALL,
+            )
+            if not m:
+                continue
+            ptype = c_type_to_pascal(m.group("type").strip())
+            name = m.group("name")
+            arr = m.group("arr")
+            if arr:
+                out.append((name, f"array[0..{arr}-1] of {ptype}"))
+            else:
+                out.append((name, ptype))
+        return out
+
     # ------------------------------------------------------------------
     def translate(self) -> str:
         with open(self.c_path, "r", encoding="utf-8", errors="replace") as f:
@@ -3179,6 +3208,51 @@ class CFileTranslator:
                 self._ast_result = None
 
         # ---- Pattern-based fallback (always run for body translation) ----
+        # ---- Extract inline struct global declarations ----
+        # Pattern: struct TAG { fields... } NAME[SIZE];  (no typedef, no extern)
+        # This is a global variable with an inline struct definition.
+        # We extract the struct as a Pascal record type and the variable
+        # as an array of that type.
+        inline_type_decls: list[str] = []
+        inline_var_decls: list[tuple[str, str]] = []
+        for m in re.finditer(
+            r"^(?:\s*)struct\s+(\w+)\s*\{([^}]*)\}\s*"
+            r"(\w+)\s*(?:\[([^\]]*)\])?\s*;",
+            src_clean, re.MULTILINE | re.DOTALL,
+        ):
+            tag = m.group(1)
+            body = m.group(2)
+            var_name = m.group(3)
+            arr_size = m.group(4)
+            # Create Pascal record type
+            pas_type_name = "T" + tag if not tag.startswith("T") else tag
+            fields = self._parse_struct_fields_c(body)
+            if fields:
+                inline_type_decls.append(f"  {pas_type_name} = record")
+                seen_f = set()
+                for fname, ftype in fields:
+                    if fname in seen_f:
+                        continue
+                    seen_f.add(fname)
+                    inline_type_decls.append(
+                        f"    {pascalify_name(fname)}: {ftype};"
+                    )
+                inline_type_decls.append("  end;")
+            # Variable declaration
+            if arr_size:
+                arr_size_pas = arr_size
+                m_hex = re.match(r"^0[xX]([0-9A-Fa-f]+)$", arr_size.strip())
+                if m_hex:
+                    arr_size_pas = "$" + m_hex.group(1)
+                inline_var_decls.append(
+                    (var_name, f"array[0..{arr_size_pas}-1] of {pas_type_name}")
+                )
+            else:
+                inline_var_decls.append((var_name, pas_type_name))
+            # Remove this from residual so it doesn't appear as TODO
+            src_clean = src_clean[:m.start()] + src_clean[m.end():]
+
+        # Re-extract globals from the modified residual
         funcs, residual = extract_functions(src_clean)
         globals_list = extract_globals(residual)
 
@@ -3238,6 +3312,13 @@ class CFileTranslator:
                 out.append(t)
             out.append("")
 
+        # Inline struct types from C file global declarations
+        # (e.g. ``struct var { ... } variables[0x200];`` in icd.c)
+        if inline_type_decls:
+            for t in inline_type_decls:
+                out.append(t)
+            out.append("")
+
         # AST-derived typedefs (more accurate than pattern-based)
         if self._ast_result is not None and self._ast_result.typedefs:
             out.append("type")
@@ -3286,6 +3367,15 @@ class CFileTranslator:
                     out.append(f"  {pascalify_name(name)}: {pas_type};")
             out.append("")
             self.stats["globals"] = len(seen_names)
+
+        # Inline struct global variables (from C file)
+        if inline_var_decls:
+            if not (self._ast_result is not None and self._ast_result.globals) \
+                    and not globals_list:
+                out.append("var")
+            for name, ptype in inline_var_decls:
+                out.append(f"  {pascalify_name(name)}: {ptype};")
+            out.append("")
 
         # Function prototypes: prefer AST-derived signatures
         out.append("// --- function declarations ---")
