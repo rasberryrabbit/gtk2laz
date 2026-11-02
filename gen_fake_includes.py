@@ -431,9 +431,18 @@ typedef unsigned long long guint64;
 }
 
 
-def main() -> int:
+def main(argv=None) -> int:
+    """Generate fake headers. If argv is given, use argv[0] as the
+    target directory; otherwise use the module-level ROOT variable."""
+    global ROOT
+    if argv:
+        import sys
+        if isinstance(argv, list):
+            ROOT = argv[0] if argv else ROOT
+        elif isinstance(argv, str):
+            ROOT = argv
     os.makedirs(ROOT, exist_ok=True)
-    for sub in ("sys", "linux", "asm", "gtk", "glib"):
+    for sub in ("sys", "linux", "asm", "gtk", "glib", "gio"):
         os.makedirs(os.path.join(ROOT, sub), exist_ok=True)
     for name, content in HEADERS.items():
         path = os.path.join(ROOT, name)
@@ -445,11 +454,28 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    import sys
+    # Allow: python gen_fake_includes.py [target_dir]
+    if len(sys.argv) > 1:
+        ROOT = sys.argv[1]
     raise SystemExit(main())
 
 
-def generate(target_dir: str = "/tmp/fake_libc_include") -> int:
-    """Generate fake includes in target_dir. Returns 0 on success."""
+def generate(target_dir: str = None) -> int:
+    """Generate fake includes in target_dir. Returns 0 on success.
+
+    If target_dir is None, uses a platform-appropriate default:
+      Linux/macOS: /tmp/fake_libc_include
+      Windows: %TEMP%\\fake_libc_include
+    """
     global ROOT
+    import os
+    import sys
+    if target_dir is None:
+        if sys.platform == "win32":
+            target_dir = os.path.join(os.environ.get("TEMP", "C:\\Temp"),
+                                       "fake_libc_include")
+        else:
+            target_dir = "/tmp/fake_libc_include"
     ROOT = target_dir
-    return main([target_dir])
+    return main()

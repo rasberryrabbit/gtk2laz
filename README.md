@@ -229,6 +229,12 @@ The translator walks each C file and emits a `.pas` unit containing:
   * Control flow: `if/else`, `for` (with `i++` step → `for i := 0 to N-1 do`),
     `while`, `do/while` → `repeat/until not (...)`, `switch` → `case/of`,
     `return` → `Exit` / `Exit(value)`.
+  * Bodyless `for` loops (e.g. `for(z=0; z<DIMBUF-5 && buf[z]!=RX16; z++);`, a
+    common C linear-search idiom) → `while ... do begin ... Inc(z); end;`.
+    Pascal's `for-to-do` iterates over a fixed range and cannot express
+    "advance until condition fails", so bodyless `for` is always converted to a
+    `while` loop with the step as its body. Empty-brace bodies (`for(...){}`)
+    are treated the same way.
   * Operators: `&&`, `||`, `!`, `==`, `!=`, `<<`, `>>` → Pascal equivalents.
   * Post-increment `x++` → `Inc(x)` (semantic approximation; the user must
     verify expressions that depend on the pre-increment value).
@@ -551,6 +557,12 @@ The translator walks each C file and emits a `.pas` unit containing:
   * Control flow: `if/else`, `for` (with `i++` step → `for i := 0 to N-1 do`),
     `while`, `do/while` → `repeat/until not (...)`, `switch` → `case/of`,
     `return` → `Exit` / `Exit(value)`.
+  * Bodyless `for` loops (e.g. `for(z=0; z<DIMBUF-5 && buf[z]!=RX16; z++);`, a
+    common C linear-search idiom) → `while ... do begin ... Inc(z); end;`.
+    Pascal's `for-to-do` iterates over a fixed range and cannot express
+    "advance until condition fails", so bodyless `for` is always converted to a
+    `while` loop with the step as its body. Empty-brace bodies (`for(...){}`)
+    are treated the same way.
   * Operators: `&&`, `||`, `!`, `==`, `!=`, `<<`, `>>` → Pascal equivalents.
   * Post-increment `x++` → `Inc(x)` (semantic approximation; the user must
     verify expressions that depend on the pre-increment value).

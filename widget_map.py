@@ -481,6 +481,94 @@ def c_type_to_pascal(c_type: str) -> str:
     return pas
 
 
+# ---------------------------------------------------------------------------
+# Pascal reserved word handling
+# ---------------------------------------------------------------------------
+# FreePascal / Object Pascal reserved words and directives that cannot be
+# used as identifiers. When a C variable/function/field name collides
+# with one of these, we append an underscore so the resulting Pascal
+# compiles.
+#
+# Source: FreePascal reference manual, "Reserved words" section, plus
+# common directives that are context-sensitive but still problematic as
+# plain identifiers.
+
+PASCAL_RESERVED_WORDS = {
+    # Strict reserved words (always reserved)
+    "absolute", "abstract", "and", "array", "as", "asm", "assembler",
+    "begin", "case", "cdecl", "class", "const", "constructor",
+    "destructor", "dispinterface", "dispid", "div", "do", "downto",
+    "dynamic", "else", "end", "except", "export", "exports", "far",
+    "file", "final", "finalization", "finally", "for", "forward",
+    "function", "goto", "if", "implementation", "implements", "in",
+    "index", "inherited", "initialization", "inline", "interface",
+    "is", "label", "library", "message", "mod", "name", "near",
+    "nil", "nodefault", "not", "object", "of", "oldfpccall", "on",
+    "or", "out", "override", "package", "packed", "pascal", "private",
+    "procedure", "program", "property", "protected", "public",
+    "published", "raise", "read", "readonly", "record", "register",
+    "reintroduce", "repeat", "resourcestring", "safecall", "sealed",
+    "set", "shl", "shr", "static", "stdcall", "stored", "string",
+    "then", "threadvar", "to", "try", "type", "unit", "until",
+    "uses", "var", "virtual", "while", "with", "write", "writeonly",
+    "xor",
+    # Boolean literals (contextually reserved)
+    "true", "false",
+    # Self is special inside methods
+    "self",
+    # Result is a built-in in functions
+    "result",
+    # Common FreePascal modes add these
+    "default", "operator", "reference", "specialize", "generic",
+    "exit", "break", "continue", "halt", "runerror",
+    # Turbo Pascal compatibility
+    "inherited", "object",
+}
+
+# Reverse mapping so we can recover the original C name if needed.
+# (Used for diagnostics; the Pascal identifier is the source of truth.)
+_PASCAL_TO_C_NAME: dict[str, str] = {}
+
+
+def pascalify_name(name: str) -> str:
+    """Convert a C identifier to a Pascal-safe identifier.
+
+    If ``name`` is a Pascal reserved word (case-insensitive), append an
+    underscore so it compiles. For example ``string`` -> ``string_``,
+    ``file`` -> ``file_``, ``name`` -> ``name_``.
+
+    Non-identifier characters are also replaced with underscores, and
+    a leading digit is prefixed with ``_``.
+    """
+    if not name:
+        return name
+    # Replace non-identifier characters with underscores
+    import re
+    safe = re.sub(r"[^\w]", "_", name)
+    # Prefix leading digit
+    if safe and safe[0].isdigit():
+        safe = "_" + safe
+    # Check reserved word (case-insensitive)
+    if safe.lower() in PASCAL_RESERVED_WORDS:
+        # Record the mapping for diagnostics
+        original = safe
+        safe = safe + "_"
+        _PASCAL_TO_C_NAME[safe] = original
+    return safe
+
+
+def is_pascal_reserved(name: str) -> bool:
+    """Return True if ``name`` (case-insensitive) is a Pascal reserved
+    word or directive that cannot be used as an identifier."""
+    return name.lower() in PASCAL_RESERVED_WORDS
+
+
+# Backwards-compatible alias used in glade_parser
+def pascalize_identifier(name: str) -> str:
+    """Alias for :func:`pascalify_name`."""
+    return pascalify_name(name)
+
+
 # C standard library functions that map to Pascal idioms
 C_LIB_MAP = {
     "printf":   ("WriteLn",  "varargs"),

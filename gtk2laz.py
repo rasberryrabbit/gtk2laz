@@ -103,9 +103,18 @@ def _order_headers(h_files: list[str],
 def convert_c_file_with_includes(c_path: str, out_dir: str,
                                   unit_name: str,
                                   form_unit: Optional[str],
-                                  included_units: list[str]) -> dict:
+                                  included_units: list[str],
+                                  header_types: list[str] = None,
+                                  header_defines: list = None,
+                                  header_externs: list = None) -> dict:
     """Convert a .c file and add the given header-derived unit names to
     the generated unit's ``uses`` clause.
+
+    ``header_types``, ``header_defines``, ``header_externs``: declarations
+    extracted from the matching .h file (same basename as the .c file).
+    These are merged into the .c file's output so that struct/enum/typedef
+    declarations from the header are preserved (otherwise the .c output
+    would overwrite the .h output since they share the same unit name).
 
     This is now a thin wrapper around ``c_parser.convert_c_file`` which
     itself accepts ``included_units`` directly (and also tries the
@@ -114,7 +123,10 @@ def convert_c_file_with_includes(c_path: str, out_dir: str,
     return convert_c_file(c_path, out_dir,
                            unit_name=unit_name,
                            form_unit=form_unit,
-                           included_units=included_units)
+                           included_units=included_units,
+                           header_types=header_types,
+                           header_defines=header_defines,
+                           header_externs=header_externs)
 
 
 def discover(root: str) -> Project:
@@ -277,13 +289,27 @@ def convert(input_dir: str, output_dir: str,
             form_class: str = "TMainForm",
             glade_name: Optional[str] = None,
             report_path: Optional[str] = None,
-            c_only: bool = False) -> dict:
+            c_only: bool = False,
+            progress_callback=None) -> dict:
     """Convert a GTK source tree into a Lazarus project.
 
     When ``c_only`` is True, the Glade form is skipped and only the C
     files are translated. Useful when the user wants pure C -> Pascal
     translation without involving the GUI definition.
+
+    ``progress_callback`` is an optional callable invoked as
+    ``progress_callback(message: str)`` at various stages of the
+    conversion (e.g. "Converting coff.h…"). The GUI uses this to
+    display the currently-processed file.
     """
+
+    def _progress(msg: str) -> None:
+        if progress_callback:
+            try:
+                progress_callback(msg)
+            except Exception:
+                pass  # don't let callback errors break conversion
+
     proj = discover(input_dir)
     proj.output_dir = output_dir
     os.makedirs(output_dir, exist_ok=True)
@@ -304,6 +330,7 @@ def convert(input_dir: str, output_dir: str,
                              "(use --c-only to skip GUI conversion)")
 
         # Convert glade -> LFM + PAS
+        _progress(f"Converting Glade: {os.path.basename(glade_path)}")
         glade_result = convert_glade(glade_path, output_dir,
                                       unit_name=form_unit,
                                       form_class_name=form_class)
@@ -340,6 +367,7 @@ def convert(input_dir: str, output_dir: str,
     # local header must come after it. We do a simple topological sort.
     header_order = _order_headers(proj.h_files, h_index)
     for h_path in header_order:
+        _progress(f"Converting header: {os.path.basename(h_path)}")
         # Resolve this header's local includes to Pascal unit names
         inc_units = []
         for inc_name in scan_local_includes(h_path):
@@ -374,6 +402,7 @@ def convert(input_dir: str, output_dir: str,
     for r in header_results:
         unit_names.append(r["unit_name"])
     for c_path in c_files_sorted:
+        _progress(f"Converting C source: {os.path.basename(c_path)}")
         base = os.path.splitext(os.path.basename(c_path))[0].lower()
         if base == "opgui" and not c_only:
             # Already represented by the form unit; skip duplicate
@@ -389,16 +418,36 @@ def convert(input_dir: str, output_dir: str,
         # Avoid self-reference (e.g. foo.c including foo.h would produce
         # both `foo` units; skip the same-named one).
         inc_units = [u for u in inc_units if u != base]
+
+        # If a header with the same basename was converted (e.g. coff.h
+        # for coff.c), merge its type/define/extern declarations into
+        # this C file's output. Otherwise the C file's output would
+        # overwrite the header's output (same unit name) and the struct/
+        # enum/typedef declarations would be lost.
+        h_basename = os.path.splitext(os.path.basename(c_path))[0] + ".h"
+        matching_header = None
+        for hr in header_results:
+            if os.path.basename(hr["source"]) == h_basename:
+                matching_header = hr
+                break
+        h_types = matching_header["header_types"] if matching_header else None
+        h_defines = matching_header["header_defines"] if matching_header else None
+        h_externs = matching_header["header_externs"] if matching_header else None
+
         result = convert_c_file_with_includes(
             c_path, output_dir,
             unit_name=base,
             form_unit=form_unit if not c_only else None,
             included_units=inc_units,
+            header_types=h_types,
+            header_defines=h_defines,
+            header_externs=h_externs,
         )
         c_results.append(result)
         unit_names.append(result["unit_name"])
 
     # Generate .lpr and .lpi (skip in c_only mode - no form to anchor to)
+    _progress("Generating project files…")
     project_name = os.path.basename(output_dir.rstrip(os.sep)) or "gtk_project"
     if not c_only:
         lpr_text = emit_lpr(project_name, form_class, unit_names)
@@ -412,6 +461,7 @@ def convert(input_dir: str, output_dir: str,
             f.write(lpi_text)
 
     # Build conversion report
+    _progress("Building conversion report…")
     report = build_report(proj, glade_result, c_results, header_results,
                           form_unit, form_class, project_name,
                           copied_res, c_only=c_only)
@@ -633,7 +683,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "Lazarus LCL project.",
     )
     parser.add_argument("--version", action="version",
-                        version="gtk2laz 2.0")
+                        version="gtk2laz 1.1")
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     # convert: full GTK -> Lazarus conversion
@@ -666,8 +716,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                            help="List all TODO markers in a converted project")
     p_lt.add_argument("output_dir", help="Converted project directory")
 
+    # diagnose: run AST diagnostics
+    sub.add_parser("diagnose",
+                    help="Run AST diagnostics to verify pycparser/ply/pcpp")
+
     raw_argv = sys.argv[1:] if argv is None else list(argv)
-    KNOWN_SUBS = {"convert", "c2pas", "gui", "list-todos", "-h", "--help"}
+    KNOWN_SUBS = {"convert", "c2pas", "gui", "list-todos", "diagnose",
+                  "-h", "--help"}
     if raw_argv and raw_argv[0] not in KNOWN_SUBS \
             and not raw_argv[0].startswith("-"):
         raw_argv = ["convert"] + raw_argv
@@ -686,6 +741,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         todos = scan_todos_in_project(args.output_dir)
         print(json.dumps(todos, indent=2, default=str))
         return 0
+
+    # ---- Subcommand: diagnose ----
+    if args.command == "diagnose":
+        import diagnose
+        return diagnose.main()
 
     # ---- Subcommand: c2pas ----
     if args.command == "c2pas":

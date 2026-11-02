@@ -89,6 +89,7 @@ class Gtk2LazApp:
         self.form_class = tk.StringVar(value="TMainForm")
         self.status_text = tk.StringVar(value="Ready.")
         self.progress = tk.IntVar(value=0)
+        self.current_file = tk.StringVar(value="")  # currently-processed file
 
         # Background-thread result queue
         self._result_q: queue.Queue = queue.Queue()
@@ -240,11 +241,18 @@ class Gtk2LazApp:
 
         middle.add(viewer_frame, weight=3)
 
-        # ---- Bottom: status + progress ----
+        # ---- Bottom: status + current file + progress ----
         bottom = ttk.Frame(self.root)
         bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=8, pady=4)
+        # Status text (left)
         ttk.Label(bottom, textvariable=self.status_text,
                   anchor=tk.W).pack(side=tk.LEFT)
+        # Current file indicator (center, highlighted)
+        self.file_label = ttk.Label(bottom, textvariable=self.current_file,
+                                     anchor=tk.W, foreground="#0066cc",
+                                     font=("TkDefaultFont", 9, "bold"))
+        self.file_label.pack(side=tk.LEFT, padx=12, fill=tk.X, expand=True)
+        # Progress bar (right)
         self.progress_bar = ttk.Progressbar(bottom, variable=self.progress,
                                              maximum=100, length=300)
         self.progress_bar.pack(side=tk.RIGHT, padx=8)
@@ -304,6 +312,7 @@ class Gtk2LazApp:
         self.run_btn.configure(state=tk.DISABLED)
         self.progress.set(5)
         self.status_text.set("Working…")
+        self.current_file.set("")  # clear file indicator
         # Clear current tree
         self.tree.delete(*self.tree.get_children())
         self.todos = []
@@ -334,10 +343,17 @@ class Gtk2LazApp:
 
             from gtk2laz import convert
             c_only = (mode == "c_only")
+
+            # Progress callback: push file messages to the result queue
+            # so the main thread can update the GUI.
+            def _on_progress(msg: str) -> None:
+                self._result_q.put(("progress", msg))
+
             result = convert(in_dir, out_dir,
                               form_unit=self.form_unit.get() or "mainform",
                               form_class=self.form_class.get() or "TMainForm",
-                              c_only=c_only)
+                              c_only=c_only,
+                              progress_callback=_on_progress)
             self._result_q.put(("ok", result))
         except Exception as e:  # noqa: BLE001
             self._result_q.put(("error", str(e)))
@@ -346,7 +362,14 @@ class Gtk2LazApp:
         try:
             while True:
                 kind, payload = self._result_q.get_nowait()
-                if kind == "ok":
+                if kind == "progress":
+                    # Update the current-file indicator
+                    self.current_file.set(payload)
+                    # Bump progress slightly so the bar looks alive
+                    cur = self.progress.get()
+                    if cur < 90:
+                        self.progress.set(cur + 2)
+                elif kind == "ok":
                     self._on_conversion_done(payload)
                 else:
                     self._on_conversion_error(payload)
@@ -370,6 +393,7 @@ class Gtk2LazApp:
                f"Output: {out_dir}"
                + ("  (C-only mode)" if c_only else ""))
         self.status_text.set(msg)
+        self.current_file.set("")  # clear file indicator on completion
         self.run_btn.configure(state=tk.NORMAL)
         # Slowly decay progress bar
         self.root.after(2000, lambda: self.progress.set(0))
@@ -377,6 +401,7 @@ class Gtk2LazApp:
     def _on_conversion_error(self, msg: str) -> None:
         self.progress.set(0)
         self.status_text.set("Conversion failed.")
+        self.current_file.set("")  # clear file indicator on error
         self.run_btn.configure(state=tk.NORMAL)
         messagebox.showerror("Conversion failed", msg)
 
