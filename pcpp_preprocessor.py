@@ -232,6 +232,21 @@ def preprocess(c_path: str,
     # might reference is in scope.  The cost is a larger text for
     # pycparser to parse, but fake headers are small (a few KB each)
     # so the overhead is negligible.
+    #
+    # ---- IMPORTANT: coord.file tracking ----
+    # pycparser uses ``#line`` directives to set ``coord.file`` on
+    # each AST node, which the converter uses to FILTER OUT nodes
+    # that came from fake headers (so fake-header typedefs don't
+    # pollute the user's .pas unit).  Without a ``#line`` directive,
+    # pycparser attributes the prepended fake-header nodes to the
+    # user's .c file, and they leak into the output.
+    #
+    # pycparser DOES support ``#line`` directives (unlike ``#if`` /
+    # ``#define`` which it does not).  We emit a ``#line 1
+    # "<fake_header>.h"`` marker BEFORE each fake header's content so
+    # pycparser attributes every node from that header to a
+    # "<fake_header>.h" coord.file, which the converter then filters
+    # out (since the user's .c file basename != "<fake_header>.h").
     fake_header_blob = _read_all_fake_headers(fake_include_dir)
     if fake_header_blob:
         text = fake_header_blob + "\n" + text
@@ -443,16 +458,32 @@ def _read_all_fake_headers(fake_include_dir: str) -> str:
     the last line of one header doesn't run into the first line of
     the next.
 
-    IMPORTANT: we strip every ``#``-prefixed preprocessor directive
+    IMPORTANT — coord.file tracking:
+    pycparser uses ``#line`` directives to set ``coord.file`` on each
+    AST node.  The converter's AST filter
+    (``ast_translator.AstToPascal.parse``) only keeps nodes whose
+    ``coord.file`` matches the user's .c file basename, so fake-header
+    typedefs don't pollute the user's .pas unit.
+
+    To make that filter work, we MUST emit a ``#line 1 "<header>.h"``
+    marker BEFORE each fake header's content.  That way pycparser
+    attributes every typedef/struct/extern from the fake header to a
+    "<header>.h" coord.file, which the filter then drops (since the
+    user's .c file basename != "<header>.h").
+
+    We also strip every OTHER ``#``-prefixed preprocessor directive
     (``#ifndef``, ``#define``, ``#endif``, ``#include``, ...) from
-    the concatenated text before returning it.  pycparser does not
-    support preprocessor directives in its input (it expects already-
-    preprocessed text), so leaving them in would abort the parse
-    with "Directives not supported yet".
+    each header's content.  pycparser does not support those in its
+    input (it expects already-preprocessed text), but it DOES support
+    ``#line`` directives — so we keep the ``#line`` markers we emit
+    and strip everything else.
     """
     if not fake_include_dir or not os.path.isdir(fake_include_dir):
         return ""
-    chunks: list[str] = []
+    # Collect (header_name, content) pairs so we can emit a #line
+    # marker before each one.  We use the basename of each .h file as
+    # the coord.file so the converter's filter can identify them.
+    header_pairs: list[tuple[str, str]] = []
     for root, _dirs, files in os.walk(fake_include_dir):
         for fname in sorted(files):
             if not fname.endswith(".h"):
@@ -461,19 +492,38 @@ def _read_all_fake_headers(fake_include_dir: str) -> str:
             try:
                 with open(fpath, "r", encoding="utf-8",
                           errors="replace") as f:
-                    chunks.append(f.read())
+                    content = f.read()
             except OSError:
                 continue
-    raw = "\n".join(chunks)
-    # Strip preprocessor directives so pycparser can parse the text.
-    # We replace each directive line with a blank line to preserve
-    # line numbering (in case any coord.line references point into
-    # the fake header region — they'll still resolve to a sensible
-    # line, just an empty one).
-    cleaned_lines = []
-    for line in raw.splitlines():
-        if line.lstrip().startswith("#"):
-            cleaned_lines.append("")
-        else:
-            cleaned_lines.append(line)
-    return "\n".join(cleaned_lines)
+            header_pairs.append((fname, content))
+    # Build the output: for each header, emit a ``#line 1 "<name>"``
+    # marker followed by the header's content with non-#line
+    # directives stripped.
+    out_parts: list[str] = []
+    for header_name, content in header_pairs:
+        # Emit a #line directive so pycparser attributes all nodes
+        # from this header to "<header_name>" coord.file.
+        out_parts.append(f'#line 1 "{header_name}"')
+        # Strip every # directive EXCEPT the #line we just emitted.
+        # We do this by processing each line of the header's content:
+        # any line starting with ``#`` that is NOT a ``#line`` we
+        # just emitted gets blanked out.
+        cleaned_lines = []
+        for line in content.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith("#") and not stripped.startswith("#line"):
+                # Strip #ifndef, #define, #endif, #include, etc. so
+                # pycparser doesn't abort with "Directives not
+                # supported yet".  Replace with a blank line to
+                # preserve line numbering.
+                cleaned_lines.append("")
+            else:
+                cleaned_lines.append(line)
+        out_parts.append("\n".join(cleaned_lines))
+        # Emit a trailing #line directive pointing back to a
+        # sentinel "<end_fake_headers>" so any code after this header
+        # (the next header, or the user's source) is correctly
+        # attributed.  We use a sentinel that won't match the user's
+        # .c file basename.
+        out_parts.append(f'#line 1 "<end_fake_header_{header_name}>"')
+    return "\n".join(out_parts)

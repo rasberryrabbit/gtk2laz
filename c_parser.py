@@ -4023,6 +4023,14 @@ class CFileTranslator:
                       "Graphics", "Dialogs", "StdCtrls", "ComCtrls",
                       "ExtCtrls", "Buttons", "Spin", "Menus", "LCLType"]
         unit_list = base_units + self.included_units
+        # Add the generated fake-type units (gtk_types, glib_types,
+        # libc_types, sys_types) so this unit can reference the
+        # fake-header typedefs (GtkWidget, gint, gpointer, fd_set,
+        # ...) that are emitted in those dedicated units instead of
+        # being duplicated in every .pas file.
+        for fake_unit in _fake_type_unit_names(self.fake_include_dir):
+            if fake_unit not in unit_list and fake_unit != self.unit_name:
+                unit_list.append(fake_unit)
         if self.form_unit and self.form_unit != self.unit_name \
                 and self.form_unit not in unit_list:
             unit_list.append(self.form_unit)
@@ -4499,6 +4507,11 @@ def convert_c_file(c_path: str, out_dir: str,
     translator2._header_line_count = translator._header_line_count
     text = translator2.translate()
     os.makedirs(out_dir, exist_ok=True)
+    # Emit the generated fake-type units (gtk_types, glib_types,
+    # libc_types, sys_types) which collect all fake-header typedefs/
+    # externs into a small number of shared units.  This avoids
+    # duplicating the same typedefs in every converted .pas file.
+    _emit_fake_type_units(out_dir, fake_include_dir)
     out_path = os.path.join(out_dir, unit_name + ".pas")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(text)
@@ -5391,3 +5404,283 @@ def _ensure_fake_includes() -> str:
     except Exception:
         _FAKE_INCLUDES_READY = False
     return _FAKE_INCLUDE_DIR
+
+
+# ---------------------------------------------------------------------------
+# Fake-header type units
+# ---------------------------------------------------------------------------
+# The fake libc/GTK stub headers declare many typedefs (GtkWidget,
+# gint, gpointer, fd_set, ...) that the user's C code references.
+# Rather than emitting these declarations in EVERY converted .pas
+# unit (which produces massive duplication), we emit them in a small
+# number of dedicated units and add those units to every .pas file's
+# ``uses`` clause.
+#
+# Naming: to avoid clashing with the user's own header-derived units
+# (which are named after the user's .h files — e.g. ``common``,
+# ``icd``, ``strings``), we group the fake headers into a few
+# well-known categories and emit one unit per category with a
+# ``_types`` suffix:
+#
+#   gtk/gtk.h                       ->  gtk_types
+#   glib.h, glib/*, gio/*           ->  glib_types
+#   sys/* (ioctl, select, stat, ...) ->  sys_types
+#   everything else (stdio, string, math, ...) -> libc_types
+#
+# These names never collide with the user's headers because the
+# user's headers produce units named after the .h basename (e.g.
+# ``common`` from common.h, ``icd`` from icd.h) — none of which end
+# in ``_types``.  The ``_types`` suffix is the convention we use to
+# mark generated type-only units.
+
+# Cache the generated unit contents so we only build them once per
+# session (the fake headers don't change between files).
+_FAKE_TYPE_UNITS_CACHE: Optional[dict[str, str]] = None
+
+
+# Map: fake header file path (relative to fake_include_dir) -> unit
+# name.  This is how we decide which generated unit a given fake
+# header's declarations belong to.
+def _classify_fake_header(rel_path: str) -> str:
+    """Return the Pascal unit name that should hold the declarations
+    from the fake header at ``rel_path`` (relative to
+    ``fake_include_dir``).
+
+    The classification is purely path-based so it is deterministic
+    and easy to reason about:
+
+      * ``gtk/gtk.h``                       -> ``gtk_types``
+      * ``glib.h`` / ``glib/*`` / ``gio/*`` -> ``glib_types``
+      * ``sys/*``                           -> ``sys_types``
+      * everything else                     -> ``libc_types``
+    """
+    # Normalize to forward slashes.
+    p = rel_path.replace("\\", "/").lstrip("/")
+    if p == "gtk/gtk.h" or p.startswith("gtk/"):
+        return "gtk_types"
+    if p == "glib.h" or p.startswith("glib/") or p.startswith("gio/"):
+        return "glib_types"
+    if p.startswith("sys/"):
+        return "sys_types"
+    return "libc_types"
+
+
+def _build_fake_type_units(fake_include_dir: str) -> dict[str, str]:
+    """Build the contents of all generated fake-type units.
+
+    Returns a dict mapping unit name -> Pascal unit text.  The unit
+    text does NOT include a trailing newline; the caller adds one
+    when writing.
+    """
+    global _FAKE_TYPE_UNITS_CACHE
+    if _FAKE_TYPE_UNITS_CACHE is not None:
+        return _FAKE_TYPE_UNITS_CACHE
+    if not fake_include_dir or not os.path.isdir(fake_include_dir):
+        _FAKE_TYPE_UNITS_CACHE = {}
+        return {}
+    # Walk the fake-include dir and group each .h file by its
+    # target unit name.  We keep the per-header content so we can
+    # emit ``#line 1 "<header>.h"`` markers in the concatenated text
+    # (helps debugging, though the generated units do not use
+    # pycparser's coord filtering).
+    groups: dict[str, list[tuple[str, str]]] = {}
+    for root, _dirs, files in os.walk(fake_include_dir):
+        for fname in sorted(files):
+            if not fname.endswith(".h"):
+                continue
+            fpath = os.path.join(root, fname)
+            rel = os.path.relpath(fpath, fake_include_dir)
+            unit_name = _classify_fake_header(rel)
+            try:
+                with open(fpath, "r", encoding="utf-8",
+                          errors="replace") as f:
+                    content = f.read()
+            except OSError:
+                continue
+            groups.setdefault(unit_name, []).append((fname, content))
+    # Build one Pascal unit per group.
+    result: dict[str, str] = {}
+    for unit_name, headers in sorted(groups.items()):
+        text = _build_one_fake_type_unit(unit_name, headers)
+        if text:
+            result[unit_name] = text
+    _FAKE_TYPE_UNITS_CACHE = result
+    return result
+
+
+def _build_one_fake_type_unit(unit_name: str,
+                              headers: list[tuple[str, str]]) -> str:
+    """Build the Pascal source text for a single fake-type unit.
+
+    ``headers`` is a list of ``(header_basename, content)`` pairs
+    whose declarations should all go into this unit.
+    """
+    # Concatenate all headers' content, stripping preprocessor
+    # directives and comments so pycparser can parse the result.
+    import re as _re_ft
+    cleaned_parts: list[str] = []
+    for _hdr_name, content in headers:
+        lines = content.splitlines()
+        kept = []
+        for line in lines:
+            stripped = line.lstrip()
+            if stripped.startswith("#"):
+                # Drop #ifndef / #define / #endif / #include so
+                # pycparser doesn't abort with "Directives not
+                # supported yet".  We replace with a blank line to
+                # preserve line numbering.
+                kept.append("")
+            else:
+                kept.append(line)
+        cleaned_parts.append("\n".join(kept))
+    cleaned = "\n".join(cleaned_parts)
+    # Strip block comments and line comments.
+    cleaned = _re_ft.sub(r"/\*.*?\*/", "", cleaned, flags=_re_ft.DOTALL)
+    cleaned = _re_ft.sub(r"//[^\n]*", "", cleaned)
+    # Parse with pycparser and collect typedef/struct/enum/extern/func.
+    types_decls: list[str] = []
+    var_decls: list[str] = []
+    func_decls: list[str] = []
+    try:
+        from ast_translator import (
+            _type_to_pascal, _typedef_to_pas,
+            _decl_to_func_signature,
+        )
+        from pycparser import CParser, c_ast
+        parser = CParser()
+        ast = parser.parse(cleaned, filename=f"<fake:{unit_name}>")
+        for ext in ast.ext:
+            if isinstance(ext, c_ast.Typedef):
+                if ext.name and ext.name.startswith("_"):
+                    continue  # skip internal tags
+                td = _typedef_to_pas(ext)
+                if td and td.pascal_decl:
+                    types_decls.append(td.pascal_decl)
+                else:
+                    pas_type = _type_to_pascal(ext.type)
+                    name = ext.name
+                    if name and pas_type:
+                        types_decls.append(f"  T{name} = {pas_type};")
+            elif isinstance(ext, c_ast.Decl):
+                if ext.storage and "extern" in ext.storage:
+                    pas_type = _type_to_pascal(ext.type)
+                    if pas_type and ext.name:
+                        var_decls.append(f"  {ext.name}: {pas_type};")
+                elif ext.type and hasattr(ext.type, "args"):
+                    fn_name = ext.name or ""
+                    if not fn_name:
+                        continue
+                    fn = _decl_to_func_signature(ext)
+                    if fn:
+                        ret = fn.return_type.strip()
+                        is_func = ret and ret != "void"
+                        params = []
+                        for ptype, pname, _ in fn.params:
+                            if not pname:
+                                continue
+                            try:
+                                if isinstance(ptype, str):
+                                    pas_p_type = _type_to_pascal(
+                                        c_ast.IdentifierType(names=[ptype]))
+                                else:
+                                    pas_p_type = _type_to_pascal(ptype)
+                                if pas_p_type:
+                                    params.append(f"{pname}: {pas_p_type}")
+                            except Exception:
+                                pass
+                        params_str = "; ".join(params)
+                        prefix = "function" if is_func else "procedure"
+                        sig = f"{prefix} {fn_name}"
+                        if params_str:
+                            sig += f"({params_str})"
+                        if is_func:
+                            try:
+                                sig += f": {_type_to_pascal(c_ast.IdentifierType(names=[ret]))}"
+                            except Exception:
+                                sig += ": Integer"
+                        func_decls.append(f"  {sig};")
+    except Exception:
+        pass
+    # Build the Pascal unit text.
+    out: list[str] = []
+    out.append(f"unit {unit_name};")
+    out.append("")
+    out.append("{$mode objfpc}{$H+}")
+    out.append("")
+    out.append("interface")
+    out.append("")
+    out.append("uses")
+    out.append("  Classes, SysUtils;")
+    out.append("")
+    if types_decls:
+        out.append("type")
+        seen: set[str] = set()
+        for decl in types_decls:
+            m_name = re.match(r"\s*T?(\w+)\s*=", decl)
+            if m_name and m_name.group(1) in seen:
+                continue
+            if m_name:
+                seen.add(m_name.group(1))
+            out.append(decl)
+        out.append("")
+    if var_decls:
+        out.append("var")
+        seen_v: set[str] = set()
+        for decl in var_decls:
+            m_name = re.match(r"\s*(\w+)\s*:", decl)
+            if m_name and m_name.group(1) in seen_v:
+                continue
+            if m_name:
+                seen_v.add(m_name.group(1))
+            out.append(decl)
+        out.append("")
+    if func_decls:
+        out.append("// --- function declarations ---")
+        seen_f: set[str] = set()
+        for decl in func_decls:
+            m_name = re.match(r"\s*(?:function|procedure)\s+(\w+)", decl)
+            if m_name and m_name.group(1) in seen_f:
+                continue
+            if m_name:
+                seen_f.add(m_name.group(1))
+            out.append(decl)
+        out.append("")
+    out.append("implementation")
+    out.append("")
+    out.append("end.")
+    out.append("")
+    return "\n".join(out)
+
+
+def _emit_fake_type_units(out_dir: str,
+                          fake_include_dir: str) -> list[str]:
+    """Write all generated fake-type units to ``out_dir``.
+
+    Returns the list of unit names that were written (e.g.
+    ``["gtk_types", "glib_types", "libc_types", "sys_types"]``).
+    The caller adds these to every converted .pas file's ``uses``
+    clause.
+    """
+    units = _build_fake_type_units(fake_include_dir)
+    if not units:
+        return []
+    written: list[str] = []
+    for unit_name, content in units.items():
+        path = os.path.join(out_dir, unit_name + ".pas")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            written.append(unit_name)
+        except OSError:
+            continue
+    return written
+
+
+def _fake_type_unit_names(fake_include_dir: str) -> list[str]:
+    """Return the list of generated fake-type unit names (without
+    writing them to disk).  Used by ``CFileTranslator.translate()`` to
+    add the units to the ``uses`` clause even on the first pass
+    (before ``_emit_fake_type_units`` has been called).
+    """
+    units = _build_fake_type_units(fake_include_dir)
+    return sorted(units.keys())
