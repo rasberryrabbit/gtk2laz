@@ -99,8 +99,22 @@ extern int usleep(unsigned int);
 #define _TIME_H
 typedef long time_t;
 struct tm { int tm_sec; int tm_min; int tm_hour; int tm_mday; int tm_mon; int tm_year; };
+struct timespec { long tv_sec; long tv_nsec; };
+struct timeval { long tv_sec; long tv_usec; };
 extern time_t time(time_t *);
 extern struct tm *localtime(const time_t *);
+extern int clock_gettime(int, struct timespec *);
+extern int gettimeofday(struct timeval *, void *);
+#define CLOCK_REALTIME 0
+#endif
+""",
+    "sys/select.h": """#ifndef _SYS_SELECT_H
+#define _SYS_SELECT_H
+typedef struct { unsigned long fds_bits[8]; } fd_set;
+extern void FD_ZERO(fd_set *);
+extern void FD_SET(int, fd_set *);
+extern void FD_CLR(int, fd_set *);
+extern int FD_ISSET(int, fd_set *);
 #endif
 """,
     "ctype.h": """#ifndef _CTYPE_H
@@ -254,7 +268,32 @@ typedef struct _GtkStatusbar GtkStatusbar;
 typedef struct _GtkTreeView GtkTreeView;
 typedef struct _GtkTreeSelection GtkTreeSelection;
 typedef struct _GtkListStore GtkListStore;
+typedef struct _GtkTreeStore GtkTreeStore;
 typedef struct _GtkTreeIter GtkTreeIter;
+typedef struct _GtkTreePath GtkTreePath;
+typedef struct _GtkTreeModel GtkTreeModel;
+typedef struct _GtkCellRenderer GtkCellRenderer;
+typedef struct _GtkCellRendererText GtkCellRendererText;
+typedef struct _GtkCellRendererPixbuf GtkCellRendererPixbuf;
+typedef struct _GtkTreeViewColumn GtkTreeViewColumn;
+typedef struct _GtkFileChooser GtkFileChooser;
+typedef struct _GtkFileChooserDialog GtkFileChooserDialog;
+typedef struct _GtkDialog GtkDialog;
+typedef struct _GtkMessageDialog GtkMessageDialog;
+typedef struct _GtkScale GtkScale;
+typedef struct _GtkHScale GtkHScale;
+typedef struct _GtkVScale GtkVScale;
+typedef struct _GtkScrollbar GtkScrollbar;
+typedef struct _GtkHScrollbar GtkHScrollbar;
+typedef struct _GtkVScrollbar GtkVScrollbar;
+typedef struct _GtkPaned GtkPaned;
+typedef struct _GtkHPaned GtkHPaned;
+typedef struct _GtkVPaned GtkVPaned;
+typedef struct _GtkSeparator GtkSeparator;
+typedef struct _GtkFrame GtkFrame;
+typedef struct _GtkAspectFrame GtkAspectFrame;
+typedef struct _GtkScrolledWindow GtkScrolledWindow;
+typedef struct _GtkDrawingArea GtkDrawingArea;
 typedef struct _GtkToggleToolButton GtkToggleToolButton;
 typedef struct _GtkToggleButton GtkToggleButton;
 typedef struct _GtkCheckButton GtkCheckButton;
@@ -270,6 +309,18 @@ typedef struct _GtkAdjustment GtkAdjustment;
 typedef struct _GtkBuilder GtkBuilder;
 typedef struct _GdkPixbuf GdkPixbuf;
 typedef struct _GdkScreen GdkScreen;
+typedef struct _GdkEventButton GdkEventButton;
+typedef struct _GdkEventKey GdkEventKey;
+typedef struct _GdkEvent GdkEvent;
+typedef struct _GdkDrawable GdkDrawable;
+typedef struct _GdkGC GdkGC;
+typedef struct _GdkPixmap GdkPixmap;
+typedef struct _GdkColor GdkColor;
+typedef struct _GdkRectangle GdkRectangle;
+typedef struct _GdkWindow GdkWindow;
+typedef struct _GdkCursor GdkCursor;
+typedef struct _GdkDevice GdkDevice;
+typedef struct _GdkDisplay GdkDisplay;
 typedef struct _GtkCssProvider GtkCssProvider;
 typedef int gboolean;
 typedef int gint;

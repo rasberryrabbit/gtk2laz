@@ -236,16 +236,53 @@ class TodoItem:
 
 
 def _split_top_level(s: str, sep: str = ",") -> list[str]:
-    """Split a string at top-level separator (respecting parens/brackets)."""
+    """Split a string at top-level separator (respecting parens/brackets
+    AND C string/char literals).
+
+    Skipping string literals matters because a string can contain
+    characters that look like the separator or like ``(`` / ``)``
+    (e.g. ``sprintf(temp, "STATUS=0x%02X (", s)`` has a ``(`` inside
+    the string that would otherwise bump the depth counter and
+    swallow the closing ``)`` of the call).
+    """
     parts: list[str] = []
     depth = 0
     cur = []
+    in_str = False
+    in_char = False
+    str_escape = False
     for ch in s:
-        if ch in "([{":
+        if in_str:
+            cur.append(ch)
+            if str_escape:
+                str_escape = False
+            elif ch == "\\":
+                str_escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if in_char:
+            cur.append(ch)
+            if str_escape:
+                str_escape = False
+            elif ch == "\\":
+                str_escape = True
+            elif ch == "'":
+                in_char = False
+            continue
+        if ch == '"':
+            in_str = True
+            cur.append(ch)
+        elif ch == "'":
+            in_char = True
+            cur.append(ch)
+        elif ch in "([{":
             depth += 1
+            cur.append(ch)
         elif ch in ")]}":
             depth -= 1
-        if ch == sep and depth == 0:
+            cur.append(ch)
+        elif ch == sep and depth == 0:
             parts.append("".join(cur).strip())
             cur = []
         else:
@@ -263,16 +300,49 @@ def _split_for_header(s: str) -> list[str]:
     exactly three parts (with empty strings where the slot was empty).
     The for-loop header is well-formed: it always has exactly two
     semicolons at top level, so the result is always length 3.
+
+    Like ``_split_top_level`` we respect C string/char literals so a
+    ``;`` inside a string literal in the init/cond/step expression
+    is not mistaken for a slot boundary.
     """
     parts: list[str] = []
     depth = 0
     cur: list[str] = []
+    in_str = False
+    in_char = False
+    str_escape = False
     for ch in s:
-        if ch in "([{":
+        if in_str:
+            cur.append(ch)
+            if str_escape:
+                str_escape = False
+            elif ch == "\\":
+                str_escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if in_char:
+            cur.append(ch)
+            if str_escape:
+                str_escape = False
+            elif ch == "\\":
+                str_escape = True
+            elif ch == "'":
+                in_char = False
+            continue
+        if ch == '"':
+            in_str = True
+            cur.append(ch)
+        elif ch == "'":
+            in_char = True
+            cur.append(ch)
+        elif ch in "([{":
             depth += 1
+            cur.append(ch)
         elif ch in ")]}":
             depth -= 1
-        if ch == ";" and depth == 0:
+            cur.append(ch)
+        elif ch == ";" and depth == 0:
             parts.append("".join(cur))
             cur = []
         else:
@@ -524,15 +594,58 @@ class BodyTranslator:
           * ';' inside ``(...)`` (for-headers, function calls, casts) is
             NOT a separator.
           * ';' immediately followed by 'else' is NOT a separator.
+          * ';' inside C string/char literals is NOT a separator
+            (so ``sprintf(buf, "a;b");`` is treated as one statement,
+            not split on the ``;`` inside the string).
+          * Parens/brackets inside C string/char literals are NOT counted
+            (so ``sprintf(buf, "abc(def)", x);`` has the ``(`` and ``)``
+            inside the string ignored by the depth tracker, and the
+            statement splits correctly on the trailing ``;``).
         """
         out: list[str] = []
         depth = 0          # brace depth {}
         paren_depth = 0    # paren depth ()
+        in_str = False     # inside "..."
+        in_char = False    # inside '...'
+        str_escape = False
         cur: list[str] = []
         i = 0
         n = len(src)
         while i < n:
             ch = src[i]
+            # ---- String/char literal handling ----
+            # We must track these so a ``;`` or ``(`/``)`` inside a
+            # literal does not influence the depth counters.
+            if in_str:
+                cur.append(ch)
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == '"':
+                    in_str = False
+                i += 1
+                continue
+            if in_char:
+                cur.append(ch)
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == "'":
+                    in_char = False
+                i += 1
+                continue
+            if ch == '"':
+                in_str = True
+                cur.append(ch)
+                i += 1
+                continue
+            if ch == "'":
+                in_char = True
+                cur.append(ch)
+                i += 1
+                continue
             # Check for 'do' keyword — do-while must be kept as one
             # statement so the 'while' part isn't split off by the ';'
             # inside or after the do-body.
@@ -2016,7 +2129,7 @@ class BodyTranslator:
         quotes) to a Pascal string expression.
 
         Handles common C escape sequences:
-          \\n  -> LineEnding
+          \\n  -> NL                  (newline constant — see notes below)
           \\t  -> #9
           \\r  -> #13
           \\0  -> #0
@@ -2025,21 +2138,54 @@ class BodyTranslator:
           \\\\ -> \\
 
         Returns a Pascal string expression like ``'hello'`` or
-        ``'hello' + LineEnding + ''``.
+        ``'hello' + NL + ''``.
+
+        Note on the newline escape: the original implementation mapped ``\\n``
+        to ``LineEnding`` (the FPC platform-line-ending constant).  That
+        works but it produces a lot of ``' + LineEnding + '`` noise for
+        strings that simply contain an embedded newline, which is the
+        common case in opgui's strings.c (e.g.
+        ``strings_en[S_dev_det]="Device detected: ..." NL "Path: %s" NL;``).
+        We now split on ``\\n`` and rejoin with ``' + NL + '``, producing
+        the cleaner ``'Device detected: ...' + NL + 'Path: %s' + NL + ''``
+        form expected by the user.  The generated unit always defines a
+        ``const NL = #10;`` constant alongside the converted code, so
+        ``NL`` resolves to the same value as ``LineEnding`` on Unix/macOS
+        and remains a single ``\n`` character on Windows (matching the
+        original C behaviour, where ``#define NL "\n"`` always produced
+        a single LF regardless of platform).
+
+        ``inner`` here is the *contents* of the C string (no surrounding
+        double quotes).  A standalone ``\\n`` (i.e. ``inner == "\\n"``)
+        is collapsed to the bare ``NL`` symbol so ``strings_en[S_NL] := NL;``
+        matches the original C intent of ``strings_en[S_NL] = NL;``.
         """
-        # Order matters: replace longer sequences first
-        result = inner
-        # Replace escape sequences with Pascal equivalents. We use a
-        # placeholder pattern to avoid double-replacement issues.
-        # Use the same approach as _translate_expr's string handling.
-        result = result.replace('\\n', "' + LineEnding + '")
-        result = result.replace('\\t', "' + #9 + '")
-        result = result.replace('\\r', "' + #13 + '")
-        result = result.replace('\\0', "' + #0 + '")
-        result = result.replace('\\"', '"')
-        result = result.replace("\\'", "''")
-        result = result.replace("\\\\", "\\")
-        return f"'{result}'"
+        # Split on \n so each piece becomes a single-quoted Pascal
+        # fragment joined by the NL constant.
+        parts = inner.split('\\n')
+        if len(parts) == 1:
+            # No newline — single Pascal string with other escapes processed
+            s = parts[0]
+            s = s.replace('\\t', "' + #9 + '")
+            s = s.replace('\\r', "' + #13 + '")
+            s = s.replace('\\0', "' + #0 + '")
+            s = s.replace('\\"', '"')
+            s = s.replace("\\'", "''")
+            s = s.replace("\\\\", "\\")
+            return f"'{s}'"
+        if len(parts) == 2 and parts[0] == "" and parts[1] == "":
+            # Standalone "\n" — collapse to the NL constant
+            return "NL"
+        pas_parts = []
+        for p in parts:
+            p = p.replace('\\t', "' + #9 + '")
+            p = p.replace('\\r', "' + #13 + '")
+            p = p.replace('\\0', "' + #0 + '")
+            p = p.replace('\\"', '"')
+            p = p.replace("\\'", "''")
+            p = p.replace("\\\\", "\\")
+            pas_parts.append(f"'{p}'")
+        return " + NL + ".join(pas_parts)
 
     # ------------------------------------------------------------------
     def _try_call_statement(self, s: str) -> bool:
@@ -2312,6 +2458,275 @@ class BodyTranslator:
             pairs.append((parts[i], parts[i + 1]))
         return pairs
 
+    def _split_ternary(self, expr: str):
+        """Split a C ternary expression ``cond ? a : b`` into (cond, a, b).
+
+        Returns ``None`` if ``expr`` is not a ternary at the top level.
+
+        We scan left-to-right tracking:
+          * paren depth (``(`` / ``)``)
+          * square-bracket depth (``[`` / ``]``)
+          * whether we are inside a C string literal (``"..."``) or a
+            char literal (``'...'``)
+
+        Only a ``?`` at the outermost level (paren depth 0, not inside any
+        string/char literal) is treated as the ternary operator. The
+        matching ``:`` is then searched at the same depth, taking into
+        account that ``a`` may itself contain nested ternaries (so we
+        greedily consume balanced ``? :`` pairs while scanning for the
+        final ``:`` at depth 0).
+
+        This avoids the previous bug where a non-greedy regex matched
+        the FIRST ``?`` even when nested inside parentheses, e.g.
+        ``(break_addr>>8)+(freeze?0x40:0)`` was split as
+        ``c="(break_addr>>8)+(freeze"`` instead of correctly recognising
+        the inner ternary ``freeze?0x40:0``.
+        """
+        depth_paren = 0
+        depth_bracket = 0
+        in_str = False
+        in_char = False
+        str_escape = False
+        ternary_q_pos = -1
+        for i, ch in enumerate(expr):
+            if in_str:
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if in_char:
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == "'":
+                    in_char = False
+                continue
+            if ch == '"':
+                in_str = True
+                continue
+            if ch == "'":
+                in_char = True
+                continue
+            if ch == "(":
+                depth_paren += 1
+                continue
+            if ch == ")":
+                depth_paren -= 1
+                continue
+            if ch == "[":
+                depth_bracket += 1
+                continue
+            if ch == "]":
+                depth_bracket -= 1
+                continue
+            if ch == "?" and depth_paren == 0 and depth_bracket == 0:
+                ternary_q_pos = i
+                break
+        if ternary_q_pos < 0:
+            return None
+        # We have a top-level '?'.  Now scan from there to find the matching
+        # ':' at the same depth.  We must skip over any nested ternaries:
+        # ``a ? b : c ? d : e`` should split as cond="a", a="b", b="c ? d : e"
+        # (right-associative).  For our use here, we want the FIRST ':' that
+        # is at depth 0 (paren/bracket) AND at ternary depth 0.  Whenever we
+        # see another '?' at depth 0, we increment a ternary counter so we
+        # skip over the matching ':'.
+        i = ternary_q_pos + 1
+        ternary_depth = 0
+        colon_pos = -1
+        while i < len(expr):
+            ch = expr[i]
+            if in_str:
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == '"':
+                    in_str = False
+            elif in_char:
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == "'":
+                    in_char = False
+            elif ch == '"':
+                in_str = True
+            elif ch == "'":
+                in_char = True
+            elif ch == "(":
+                depth_paren += 1
+            elif ch == ")":
+                depth_paren -= 1
+            elif ch == "[":
+                depth_bracket += 1
+            elif ch == "]":
+                depth_bracket -= 1
+            elif depth_paren == 0 and depth_bracket == 0:
+                if ch == "?":
+                    ternary_depth += 1
+                elif ch == ":":
+                    if ternary_depth == 0:
+                        colon_pos = i
+                        break
+                    ternary_depth -= 1
+            i += 1
+        if colon_pos < 0:
+            return None
+        c_raw = expr[:ternary_q_pos].strip()
+        a_raw = expr[ternary_q_pos + 1:colon_pos].strip()
+        b_raw = expr[colon_pos + 1:].strip()
+        return (c_raw, a_raw, b_raw)
+
+    def _expr_contains_top_level_question(self, expr: str) -> bool:
+        """Return True if ``expr`` contains a ``?`` character anywhere
+        outside of string/char literals (i.e. it is or contains a C
+        ternary operator).  Used to decide whether to recurse into the
+        expression looking for nested ternaries that the top-level
+        split missed.
+        """
+        in_str = False
+        in_char = False
+        str_escape = False
+        for ch in expr:
+            if in_str:
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if in_char:
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == "'":
+                    in_char = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "'":
+                in_char = True
+            elif ch == "?":
+                return True
+        return False
+
+    def _translate_nested_ternaries(self, expr: str) -> str:
+        """Recursively translate any ``cond ? a : b`` ternaries that
+        appear *inside* parenthesised sub-expressions of ``expr``.
+
+        The top-level ternary (if any) was already handled by the caller.
+        Here we look for parenthesised groups that contain a ``?`` and
+        recursively translate the contents of those groups, then
+        re-assemble the expression with the translated groups in place.
+
+        We do this by scanning ``expr`` once, identifying each top-level
+        parenthesised run (``(...)``, ``[...]``), and whenever a run
+        contains a ``?`` we recursively call ``_translate_expr`` on its
+        inner text (which will itself handle any deeper-nested ternary
+        or apply the OP_REPLACE / cast / etc. fallbacks).  String and
+        char literals are skipped so a ``?`` inside a string does not
+        trigger recursion.
+
+        Example: ``(break_addr>>8)+(freeze?0x40:0)``
+          ->  ``(break_addr>>8)+(IfThen(freeze, $40, 0))``
+        (after the inner ternary is recursively translated; the caller
+        then applies OP_REPLACE / hex conversion in the usual way).
+        """
+        if not expr:
+            return expr
+        out: list[str] = []
+        i = 0
+        n = len(expr)
+        in_str = False
+        in_char = False
+        str_escape = False
+        while i < n:
+            ch = expr[i]
+            if in_str:
+                out.append(ch)
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == '"':
+                    in_str = False
+                i += 1
+                continue
+            if in_char:
+                out.append(ch)
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == "'":
+                    in_char = False
+                i += 1
+                continue
+            if ch == '"':
+                in_str = True
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "'":
+                in_char = True
+                out.append(ch)
+                i += 1
+                continue
+            if ch in "([":
+                # Find the matching close paren/bracket at the same depth
+                open_ch = ch
+                close_ch = ")" if ch == "(" else "]"
+                depth = 1
+                j = i + 1
+                while j < n and depth > 0:
+                    cj = expr[j]
+                    if cj == '"' or cj == "'":
+                        # Skip the string/char literal entirely so any
+                        # paren-like characters inside it are ignored.
+                        quote = cj
+                        j += 1
+                        while j < n:
+                            if expr[j] == "\\" and j + 1 < n:
+                                j += 2
+                                continue
+                            if expr[j] == quote:
+                                j += 1
+                                break
+                            j += 1
+                        continue
+                    if cj == open_ch:
+                        depth += 1
+                    elif cj == close_ch:
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                if depth != 0:
+                    # Unbalanced — leave the rest verbatim
+                    out.append(expr[i:])
+                    break
+                inner = expr[i + 1:j]
+                # If the inner text contains a ``?`` (outside strings),
+                # translate it recursively; otherwise leave it alone so
+                # the caller's normal handling can apply.
+                if self._expr_contains_top_level_question(inner):
+                    translated = self._translate_expr(inner)
+                    out.append(open_ch + translated + close_ch)
+                else:
+                    out.append(expr[i:j + 1])
+                i = j + 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
     # ------------------------------------------------------------------
     # Expression translator
     # ------------------------------------------------------------------
@@ -2319,32 +2734,71 @@ class BodyTranslator:
         expr = expr.strip()
         if not expr:
             return ""
-        # Ternary
-        m = re.match(r"^(?P<c>.+?)\s*\?\s*(?P<a>[^:]+?)\s*:\s*(?P<b>.+)$",
-                     expr, re.DOTALL)
-        if m:
-            c = self._translate_expr(m.group("c"))
-            a = self._translate_expr(m.group("a"))
-            b = self._translate_expr(m.group("b"))
+        # Ternary  (depth-aware: only split on top-level ?: operators)
+        # The previous simple non-greedy regex matched the FIRST '?' in the
+        # expression even when nested inside parentheses. For example,
+        # ``(break_addr>>8)+(freeze?0x40:0)`` was split as
+        #   c = "(break_addr>>8)+(freeze", a = "0x40", b = "0)"
+        # which produced malformed Pascal ``IfThen((break_addr shr 8)+(freeze, $40, 0))``.
+        # We now scan the expression left-to-right tracking paren/string
+        # depth, and only split on a ``?`` that is at depth 0.
+        ternary = self._split_ternary(expr)
+        if ternary:
+            c_raw, a_raw, b_raw = ternary
+            c = self._translate_expr(c_raw)
+            a = self._translate_expr(a_raw)
+            b = self._translate_expr(b_raw)
             return f"IfThen({c}, {a}, {b})"
+        # If the whole expression is wrapped in a single pair of parens
+        # AND there is a top-level binary operator inside those parens,
+        # we still want to honour any ternary nested inside (e.g.
+        # ``(break_addr>>8)+(freeze?0x40:0)`` — the ternary is inside the
+        # second paren group, not at the top level of the whole
+        # expression).  Walk the expression looking for parenthesised
+        # sub-groups and recursively translate any that contain a ``?``.
+        # This preserves the structure (we still emit the surrounding
+        # parens / operators verbatim) but lets the inner ternary be
+        # converted to ``IfThen(...)``.
+        if self._expr_contains_top_level_question(expr):
+            expr = self._translate_nested_ternaries(expr)
         # GTK/libc call expression
-        m = re.match(r"^(?P<fn>[A-Za-z_]\w*)\s*\((?P<args>.*)\)$", expr, re.DOTALL)
+        # Match: NAME(args) where args is balanced (handles nested parens
+        # and multiple function calls in one expression like
+        # ``strlen("") + strlen("hello")`` — only the FIRST call is matched)
+        m = re.match(r"^(?P<fn>[A-Za-z_]\w*)\s*\(", expr)
         if m:
+            # Find the matching closing paren
             fn = m.group("fn")
-            args_raw = m.group("args")
-            args = self._split_args(args_raw)
-            info = lookup_gtk_call(fn)
-            if info:
-                template, kind = info
-                return self._instantiate_template(template, fn, args) or "nil"
-            lib = lookup_c_lib(fn)
-            if lib:
-                template, kind = lib
-                if kind == "expr":
-                    return self._instantiate_lib_template(template, args) or "0"
-            # Generic: translate args and rebuild call
-            arg_strs = [self._translate_expr(a) for a in args]
-            return f"{fn}({', '.join(arg_strs)})"
+            paren_start = m.end() - 1  # position of '('
+            depth = 1
+            j = paren_start + 1
+            while j < len(expr) and depth > 0:
+                if expr[j] == "(":
+                    depth += 1
+                elif expr[j] == ")":
+                    depth -= 1
+                j += 1
+            if depth == 0:
+                args_raw = expr[paren_start + 1:j - 1]
+                trailing = expr[j:].strip()
+                args = self._split_args(args_raw)
+                # If there's trailing text (e.g. ``strlen("") + strlen("x")``),
+                # this is NOT a simple function call — it's a compound
+                # expression. Fall through to operator handling.
+                if not trailing:
+                    info = lookup_gtk_call(fn)
+                    if info:
+                        template, kind = info
+                        return self._instantiate_template(template, fn, args) or "nil"
+                    lib = lookup_c_lib(fn)
+                    if lib:
+                        template, kind = lib
+                        if kind == "expr":
+                            return self._instantiate_lib_template(template, args) or "0"
+                    # Generic: translate args and rebuild call
+                    arg_strs = [self._translate_expr(a) for a in args]
+                    return f"{fn}({', '.join(arg_strs)})"
+                # Has trailing — not a simple call, fall through
         # Cast: (type)expr
         m = re.match(r"^\((?P<type>[\w\s\*]+)\)\s*(?P<expr>.+)$", expr)
         if m:
@@ -2360,13 +2814,12 @@ class BodyTranslator:
             return "False"
         # String literal
         if expr.startswith('"') and expr.endswith('"'):
-            # C escape sequences
+            # Strip the surrounding quotes and reuse the shared helper so
+            # ``\n`` becomes a ``' + NL + '`` joiner (and ``"\n"`` collapses
+            # to ``NL``).  Other escapes (``\t``, ``\r``, ``\0``, ``\"``,
+            # ``\'``, ``\\``) are processed too.
             inner = expr[1:-1]
-            inner = inner.replace('\\n', "' + LineEnding + '")
-            inner = inner.replace('\\t', "' + #9 + '")
-            inner = inner.replace('\\"', '"')
-            inner = inner.replace("\\'", "''")
-            return f"'{inner}'"
+            return self._translate_c_string(inner)
         # Char literal
         if expr.startswith("'") and expr.endswith("'") and len(expr) >= 3:
             return f"#{ord(expr[1])}" if len(expr) == 3 else f"'{expr[1:-1]}'"
@@ -2377,9 +2830,6 @@ class BodyTranslator:
         if m:
             return f"${m.group(1)}"
         # ---- Identifier name remapping ----
-        # If the expression is a simple identifier that was remapped
-        # (because it's a Pascal reserved word), return the remapped name.
-        # e.g. C variable ``type`` -> Pascal ``type_``
         if re.match(r"^\w+$", expr) and expr in self._name_map:
             return self._name_map[expr]
         # ---- Logical operators (&&, ||) — wrap each side in parens ----
@@ -2391,6 +2841,17 @@ class BodyTranslator:
         # Also note: we must split on && / || at top level (depth 0) to
         # avoid breaking expressions inside parentheses, function calls,
         # or array subscripts.
+        #
+        # IMPORTANT: this MUST run BEFORE ``_split_comparison``.  In C,
+        # ``&&`` / ``||`` have LOWER precedence than ``<`` / ``==`` /
+        # ``!=``, so for an expression like ``z<DIMBUF-1 && bufferI[z]!=READ_PINS``
+        # we must split on ``&&`` first and then recurse into each
+        # comparison operand.  The previous code called ``_split_comparison``
+        # first, which happily split on the very first ``<`` it saw at
+        # paren depth 0 and then handed the *rest* (``DIMBUF-1 && bufferI[z]!=READ_PINS``)
+        # off as the right-hand side — producing broken output like
+        # ``z < (DIMBUF-1) and (bufferI[z]) <> READ_PINS`` where the
+        # right-hand side ``bufferI[z]`` was parenthesised incorrectly.
         logical = self._split_logical(expr)
         if logical:
             op, parts = logical
@@ -2407,6 +2868,19 @@ class BodyTranslator:
                 else:
                     wrapped.append(f"({p})")
             return pas_op.join(wrapped)
+        # ---- Comparison operators (==, !=, <, >, <=, >=) ----
+        # Split on top-level comparison operators so each side is
+        # translated independently. This ensures string literals inside
+        # function call arguments (e.g. ``strcmp(s, "") == 0``) are
+        # properly converted to Pascal string literals.
+        comp = self._split_comparison(expr)
+        if comp:
+            op, left, right = comp
+            pas_left = self._translate_expr(left)
+            pas_right = self._translate_expr(right)
+            pas_op = {"==": "=", "!=": "<>", "<": "<", ">": ">",
+                      "<=": "<=", ">=": ">="}[op]
+            return f"{pas_left} {pas_op} {pas_right}"
         # ---- Address-of operator: &var -> @var ----
         # C: ``&a`` means "address of a".
         # Pascal: ``@a`` means the same thing.
@@ -2480,14 +2954,26 @@ class BodyTranslator:
                 return result
         # Operators
         result = expr
+        # ---- Convert C string literals ("...") -> Pascal ('...') FIRST ----
+        # This must happen before _OP_REPLACE because operators like ``&``
+        # could appear inside strings and must not be replaced.
+        # Also handles escape sequences.
+        result = self._convert_string_literals(result)
         # ---- Convert hex literals (0x...) -> $... throughout the expression ----
         # This must happen BEFORE operator replacement because ``&`` etc.
         # might appear adjacent to hex literals.
         # Match: 0x followed by hex digits, with optional U/L suffixes.
         # Don't match inside string literals (single/double quoted).
         result = self._convert_hex_literals(result)
-        for old, new in self._OP_REPLACE:
-            result = result.replace(old, new)
+        # Apply C->Pascal operator replacements.  CRITICAL: we must NOT
+        # touch anything inside a single-quoted Pascal string literal —
+        # characters like ``%`` are valid in Pascal format strings (used
+        # by sscanf/sprintf/Format) and must be preserved verbatim.  The
+        # naive ``result.replace(old, new)`` would corrupt them (e.g.
+        # ``'break %x'`` would become ``'break  mod x'``).  We split the
+        # result into string-literal / non-string segments and apply the
+        # replacements only to the non-string segments.
+        result = self._apply_op_replace_outside_strings(result)
         # Collapse multiple spaces (introduced by operator replacement
         # when the source already had spaces around operators) into one.
         # But preserve spaces inside string literals — we do a simple
@@ -2550,6 +3036,153 @@ class BodyTranslator:
                 continue
             out.append(ch)
             i += 1
+        return "".join(out)
+
+    @staticmethod
+    def _convert_string_literals(s: str) -> str:
+        """Convert all C double-quoted string literals in ``s`` to Pascal
+        single-quoted strings, handling escape sequences.
+
+        ``"hello\\n"`` -> ``'hello' + NL + ''``
+        ``"\\n"`` -> ``NL``            (bare constant reference)
+        ``""`` -> ``''``
+        ``"plain"`` -> ``'plain'``
+
+        Skips single-quoted char literals.
+
+        Newlines (``\\n``) are split out as ``' + NL + '`` rather than
+        ``' + LineEnding + '`` so that the generated source reads the way
+        opgui's strings.c defines them (``#define NL "\\n"``); the unit
+        emits a matching ``const NL = #10;`` so the symbol resolves
+        correctly.  Other escape sequences (``\\t``, ``\\r``, ``\\0``)
+        still expand to their Pascal control-char forms.
+        """
+        out: list[str] = []
+        i = 0
+        n = len(s)
+        while i < n:
+            ch = s[i]
+            if ch == '"':
+                # Find the closing quote (handle escape \")
+                j = i + 1
+                while j < n:
+                    if s[j] == '\\' and j + 1 < n:
+                        j += 2
+                        continue
+                    if s[j] == '"':
+                        break
+                    j += 1
+                if j >= n:
+                    # No closing quote — take rest of string
+                    out.append(s[i:])
+                    break
+                inner = s[i+1:j]
+                # Reuse _translate_c_string so the escape-sequence and
+                # ``' + NL + '`` handling stays consistent with the
+                # _translate_expr path.
+                out.append(BodyTranslator._translate_c_string(inner))
+                i = j + 1
+                continue
+            out.append(ch)
+            i += 1
+        return "".join(out)
+
+    def _apply_op_replace_outside_strings(self, s: str) -> str:
+        """Apply every ``_OP_REPLACE`` substitution (e.g. ``%`` -> `` mod ``,
+        ``&&`` -> `` and ``, ``>>`` -> `` shr ``, ``&`` -> `` and ``) to
+        ``s`` while leaving characters inside Pascal string/char literals
+        untouched.
+
+        The original implementation used a plain ``result.replace(old,
+        new)`` loop, which corrupted format strings such as
+        ``'break %x'`` -> ``'break  mod x'`` because the ``%`` inside the
+        Pascal string literal was treated as a modulo operator.  We now
+        split the input into ``string-literal`` and ``non-string``
+        segments and apply the operator replacements only to the
+        non-string segments.
+
+        Both Pascal single-quoted strings (``'...'``) and any leftover
+        C double-quoted strings (``"..."``) are skipped; the latter can
+        still appear here for unusual inputs that did not go through
+        ``_convert_string_literals`` first.
+        """
+        # Walk through ``s`` collecting (segment, is_string) pairs, then
+        # apply the OP_REPLACE table only to the non-string segments.
+        out: list[str] = []
+        i = 0
+        n = len(s)
+        in_str = False
+        in_char = False
+        str_escape = False
+        cur = []
+        cur_is_string = False
+        segs: list[tuple[str, bool]] = []
+        while i < n:
+            ch = s[i]
+            if in_str:
+                cur.append(ch)
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == "'":
+                    in_str = False
+                i += 1
+                continue
+            if in_char:
+                cur.append(ch)
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == "'":
+                    in_char = False
+                i += 1
+                continue
+            if ch == "'":
+                # Flush non-string segment, start a string segment.
+                if cur:
+                    segs.append(("".join(cur), False))
+                    cur = []
+                cur.append(ch)
+                in_str = True
+                i += 1
+                continue
+            if ch == '"':
+                if cur:
+                    segs.append(("".join(cur), False))
+                    cur = []
+                cur.append(ch)
+                # Find the matching closing quote (honouring backslash
+                # escapes) so the whole C string is treated as one segment.
+                j = i + 1
+                while j < n:
+                    if s[j] == "\\" and j + 1 < n:
+                        cur.append(s[j])
+                        cur.append(s[j + 1])
+                        j += 2
+                        continue
+                    cur.append(s[j])
+                    if s[j] == '"':
+                        j += 1
+                        break
+                    j += 1
+                segs.append(("".join(cur), True))
+                cur = []
+                i = j
+                continue
+            cur.append(ch)
+            i += 1
+        if cur:
+            segs.append(("".join(cur), False))
+        # Apply _OP_REPLACE to non-string segments only.
+        for text, is_string in segs:
+            if is_string:
+                out.append(text)
+                continue
+            for old, new in self._OP_REPLACE:
+                text = text.replace(old, new)
+            out.append(text)
         return "".join(out)
 
     @staticmethod
@@ -2887,6 +3520,89 @@ class BodyTranslator:
         trailing = expr[i:].strip()
         return (operand, trailing)
 
+    def _split_comparison(self, expr: str):
+        """Split an expression on a top-level comparison operator.
+
+        Returns ``(op, left, right)`` if a top-level comparison is found,
+        or ``None`` if not. The split respects parentheses and string
+        literals so that ``strcmp(s, "") == 0`` is split on ``==`` (not
+        on any ``=`` inside the string ``""``).
+
+        We also avoid splitting on ``<`` or ``>`` that are part of a
+        shift operator (``<<``, ``>>``): the previous implementation
+        skipped only the *first* char of a shift pair, so ``2000>>8``
+        was matched at the *second* ``>`` and split as
+        ``('>', '2000>', '8')``, corrupting the shift into ``> >``.
+        We now skip the entire ``<<`` / ``>>`` token before resuming the
+        scan, so the second ``<`` / ``>`` is not mistaken for a
+        comparison operator.
+        """
+        depth = 0
+        paren_depth = 0
+        in_str = False
+        in_char = False
+        str_char = ""
+        str_escape = False
+        i = 0
+        n = len(expr)
+        # Two-char operators first: ==, !=, <=, >=
+        while i < n:
+            ch = expr[i]
+            # ---- Skip string/char literal contents ----
+            if in_str:
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == str_char:
+                    in_str = False
+                i += 1
+                continue
+            if in_char:
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == str_char:
+                    in_char = False
+                i += 1
+                continue
+            if ch in ('"', "'"):
+                in_str = ch == '"'
+                in_char = ch == "'"
+                str_char = ch
+                i += 1
+                continue
+            # ---- Track paren depth ----
+            if ch == "(":
+                paren_depth += 1
+                i += 1
+                continue
+            if ch == ")":
+                paren_depth -= 1
+                i += 1
+                continue
+            # ---- Only consider top-level comparison operators ----
+            if paren_depth == 0:
+                two = expr[i:i+2]
+                # ==, !=, <=, >= (and bitwise-or-assign | = etc. are
+                # handled elsewhere, not here).
+                if two in ("==", "!=", "<=", ">="):
+                    return (two, expr[:i].strip(), expr[i+2:].strip())
+                # Shift operators: << / >>.  Skip the whole token so
+                # neither ``<`` nor ``>`` is mistaken for a comparison.
+                if two in ("<<", ">>"):
+                    i += 2
+                    continue
+                # Single-char < or > (but not << or >> — already
+                # handled above).
+                if ch in "<>" and i + 1 < n and expr[i+1] not in "<>":
+                    return (ch, expr[:i].strip(), expr[i+1:].strip())
+                if ch in "<>" and i + 1 >= n:
+                    return (ch, expr[:i].strip(), "")
+            i += 1
+        return None
+
     def _split_logical(self, expr: str):
         """Split a top-level ``&&`` / ``||`` chain into operands.
 
@@ -2898,17 +3614,56 @@ class BodyTranslator:
         found at top level (``||`` wins over ``&&``), mirroring C
         precedence so that ``a || b && c`` is split on ``||`` first and
         ``b && c`` is recursed into on the next call.
+
+        String and char literals are skipped so that a ``&`` or ``|``
+        inside a string literal does not falsely trigger a split on
+        ``&&`` / ``||`` (e.g. ``strcmp(s, "&&") == 0`` would otherwise
+        be split on the ``&&`` inside the string).
         """
-        depth = 0
         # First pass: find top-level || (lowest precedence in C)
         # If found, split there. Otherwise split on &&.
         for target_op in ("||", "&&"):
             parts: list[str] = []
             cur: list[str] = []
             i = 0
+            depth = 0
+            in_str = False
+            in_char = False
+            str_escape = False
             found = False
-            while i < len(expr):
+            n = len(expr)
+            while i < n:
                 ch = expr[i]
+                if in_str:
+                    cur.append(ch)
+                    if str_escape:
+                        str_escape = False
+                    elif ch == "\\":
+                        str_escape = True
+                    elif ch == '"':
+                        in_str = False
+                    i += 1
+                    continue
+                if in_char:
+                    cur.append(ch)
+                    if str_escape:
+                        str_escape = False
+                    elif ch == "\\":
+                        str_escape = True
+                    elif ch == "'":
+                        in_char = False
+                    i += 1
+                    continue
+                if ch == '"':
+                    in_str = True
+                    cur.append(ch)
+                    i += 1
+                    continue
+                if ch == "'":
+                    in_char = True
+                    cur.append(ch)
+                    i += 1
+                    continue
                 if ch in "([{":
                     depth += 1
                     cur.append(ch)
@@ -3277,6 +4032,15 @@ class CFileTranslator:
         out.append("")
         # Constants from #define
         defines = self._extract_defines(directives)
+        # Always emit a NL constant so that multi-line C string literals
+        # (which we translate to ``'text' + NL + 'more'``) resolve to the
+        # same single-LF value the original C ``#define NL "\n"`` produced.
+        # We skip emitting it if a #define in this very unit already
+        # provides NL (e.g. opgui's strings.c does ``#define NL "\n"``),
+        # so the user's own definition wins.
+        define_names = {name for name, _ in defines}
+        if "NL" not in define_names:
+            defines.insert(0, ("NL", "#10"))
         if defines:
             out.append("const")
             for name, val in defines:
@@ -3500,7 +4264,16 @@ class CFileTranslator:
             # Translate common C literal forms
             val = re.sub(r"\b0x([0-9A-Fa-f]+)\b", r"$\1", val)
             val = val.replace("TRUE", "True").replace("FALSE", "False")
-            val = re.sub(r'"([^"]*)"', r"'\1'", val)
+            # Convert C string literals to Pascal string expressions.
+            # We must handle escape sequences properly: a C literal like
+            # ``"\n"`` should become Pascal ``#10`` (a 1-char string), not
+            # ``'\n'`` (which in Pascal is the 2-char string ``\``+``n``).
+            # Likewise ``"\t"`` -> ``#9``, ``"\r"`` -> ``#13`` and longer
+            # strings such as ``"hello\n"`` -> ``'hello' + NL + ''``.
+            # The unit emits ``const NL = #10;`` up-front (or the user's
+            # source defines it themselves, as opgui/strings.c does) so
+            # references to ``NL`` resolve to the same single-LF value.
+            val = self._convert_c_string_in_define(val)
             # Skip values that still contain operators we don't handle
             if any(op in val for op in ["->", "<<", ">>"]):
                 continue
@@ -3509,6 +4282,77 @@ class CFileTranslator:
             seen.add(name)
             out.append((name, val))
         return out
+
+    @staticmethod
+    def _convert_c_string_in_define(val: str) -> str:
+        """Replace every double-quoted C string literal in ``val`` with
+        the equivalent Pascal string expression, processing C escape
+        sequences.  Non-string portions of ``val`` (numbers, identifiers,
+        operators) are left untouched.
+
+        Used by ``_extract_defines`` to translate ``#define`` values such
+        as ``"\\n"`` or ``"hello\\nworld"`` into Pascal.
+
+        Single newline escapes become ``' + NL + '`` joiners so the
+        generated code reads naturally; a standalone ``"\\n"`` becomes
+        the bare constant reference ``NL`` (rather than ``'' + NL + ''``)
+        which matches how opgui/strings.c declares the ``NL`` macro.
+        """
+        out: list[str] = []
+        i = 0
+        n = len(val)
+        while i < n:
+            ch = val[i]
+            if ch != '"':
+                out.append(ch)
+                i += 1
+                continue
+            # Find the closing quote (handle \" escapes)
+            j = i + 1
+            while j < n:
+                if val[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if val[j] == '"':
+                    break
+                j += 1
+            if j >= n:
+                # Unterminated — append the rest verbatim
+                out.append(val[i:])
+                break
+            inner = val[i + 1:j]
+            i = j + 1
+            # Split on \n so each piece becomes a single-quoted Pascal
+            # fragment and the joiner is the NL constant.
+            parts = inner.split("\\n")
+            if len(parts) == 1 and parts[0] == "":
+                # Empty C string "" -> '' in Pascal
+                out.append("''")
+                continue
+            if len(parts) == 2 and parts[0] == "" and parts[1] == "":
+                # Special case: standalone "\n" — translate to Pascal
+                # char literal ``#10`` rather than ``NL``.  Using ``NL``
+                # here would create a self-referential constant when the
+                # very macro being defined IS ``NL`` (i.e. ``#define NL
+                # "\n"`` -> ``const NL = NL;``).  ``#10`` is the same
+                # single-LF value and is the form Pascal users expect for
+                # a newline character constant.
+                out.append("#10")
+                continue
+            # For each piece, process the remaining escapes and wrap in
+            # single quotes.  Empty pieces become '' (which combines
+            # harmlessly with the NL joiner).
+            pas_parts = []
+            for p in parts:
+                p = p.replace("\\t", "' + #9 + '")
+                p = p.replace("\\r", "' + #13 + '")
+                p = p.replace("\\0", "' + #0 + '")
+                p = p.replace('\\"', '"')
+                p = p.replace("\\'", "''")
+                p = p.replace("\\\\", "\\")
+                pas_parts.append(f"'{p}'")
+            out.append(" + NL + ".join(pas_parts))
+        return "".join(out)
 
     # ------------------------------------------------------------------
     def _split_name_init(self, name_init: str) -> tuple[str, str]:

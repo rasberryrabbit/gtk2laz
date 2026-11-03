@@ -36,8 +36,17 @@ try:
     _HAS_PCPP = True
 except ImportError:
     _HAS_PCPP = False
-    OutputDirective = None
-    Action = None
+    # Provide stub base classes so the module-level class definitions
+    # below don't raise ``NameError`` when pcpp is not installed.  The
+    # stubs are never used at runtime because ``preprocess()`` checks
+    # ``is_available()`` (which returns ``_HAS_PCPP``) before creating
+    # any instance of ``FakeIncludePreprocessor``.
+    class Preprocessor:  # type: ignore[no-redef]
+        pass
+    class OutputDirective:  # type: ignore[no-redef]
+        pass
+    class Action:  # type: ignore[no-redef]
+        pass
 
 
 class FakeIncludePreprocessor(Preprocessor):
@@ -188,6 +197,56 @@ def preprocess(c_path: str,
     pp.write(out)
     text = out.getvalue()
 
+    # ---- Auto-inject fake GTK/GDK header if the preprocessed text
+    # references GTK/GDK types but the source did not include <gtk/gtk.h>
+    # explicitly.  This is common in opgui: icd.h declares
+    # ``extern GtkWidget *statusTxt;`` etc. without including gtk.h,
+    # relying on the includer (opgui.c) to provide the types via the
+    # common.h chain.  When pycparser parses the preprocessed text it
+    # sees ``GtkWidget`` used as a type name with no typedef in scope
+    # and aborts with "Invalid declaration", which causes the whole
+    # .c file's AST parse to fail (and the converter falls back to the
+    # pattern-based extractor, which only finds ~half the functions).
+    #
+    # We detect the situation by looking for known GTK/GDK type names
+    # in the preprocessed text that did NOT come from the fake gtk.h
+    # already (i.e. there is no ``typedef struct _GtkWidget GtkWidget;``
+    # line in the output).  When that happens we prepend the contents
+    # of the fake ``gtk/gtk.h`` so pycparser sees the typedefs.
+    # ---- Always prepend ALL fake system headers so pycparser sees
+    # every typedef/struct the user's code might reference, even if
+    # the source did not #include the corresponding system header.
+    #
+    # Real C compilers resolve ``fd_set``, ``struct timeval``, etc.
+    # through the user's include chain (``common.h`` -> ``deviceRW.h``
+    # -> <sys/select.h> -> <sys/time.h> -> ...).  pycparser only sees
+    # what the preprocessor expands, and the fake headers we ship
+    # only get pulled in if the user explicitly includes them.  When
+    # a header like opgui's icd.h uses ``GtkWidget`` without including
+    # <gtk/gtk.h> (relying on common.h to provide it), pycparser
+    # aborts with "Invalid declaration" and the whole AST parse fails.
+    #
+    # We work around this by concatenating EVERY fake header in the
+    # fake include directory and prepending the result to the
+    # preprocessed text.  This guarantees every typedef the user
+    # might reference is in scope.  The cost is a larger text for
+    # pycparser to parse, but fake headers are small (a few KB each)
+    # so the overhead is negligible.
+    fake_header_blob = _read_all_fake_headers(fake_include_dir)
+    if fake_header_blob:
+        text = fake_header_blob + "\n" + text
+    # ---- Auto-define any remaining Gtk*/Gdk* type names that the
+    # fake gtk.h didn't already cover.  Even with all fake headers
+    # prepended, a real GTK app may reference typedefs that aren't
+    # in any of our stubs (GtkTreeModelForeachFunc, GtkAccelGroup,
+    # ...).  We scan the preprocessed text for any identifier
+    # starting with ``Gtk`` or ``Gdk`` (or GLib's ``G`` prefix
+    # followed by an uppercase then lowercase letter) and emit a
+    # placeholder typedef for each one that is not already defined.
+    # This keeps pycparser happy so the AST parse succeeds and we
+    # can extract all function bodies.
+    text = _inject_missing_gtk_typedefs(text)
+
     # pcpp emits #line directives (since we set line_directive = "#line").
     # pycparser understands #line directives and uses them to set coord.file
     # on each AST node, which lets us filter out system-header nodes.
@@ -204,6 +263,217 @@ def preprocess(c_path: str,
     return "\n".join(cleaned_lines)
 
 
+# Known GTK/GDK type names that, if they appear in preprocessed C source
+# without a corresponding typedef, indicate the source relies on a
+# system GTK header that was not preprocessed in.  We use a conservative
+# list of the most common GtkWidget-derived types so the auto-injection
+# only triggers for genuine GTK-using files.
+_GTK_TYPE_NAMES = (
+    "GtkWidget", "GtkWindow", "GtkButton", "GtkLabel", "GtkEntry",
+    "GtkBox", "GtkNotebook", "GtkComboBox", "GtkComboBoxText",
+    "GtkSpinButton", "GtkTextView", "GtkTextBuffer", "GtkTextIter",
+    "GtkListStore", "GtkTreeStore", "GtkTreeIter", "GtkTreePath",
+    "GtkTreeModel", "GtkTreeSelection", "GtkCellRenderer",
+    "GtkFileChooser", "GtkFileChooserDialog", "GtkDialog",
+    "GtkCheckMenuItem", "GtkMenu", "GtkMenuBar", "GtkMenuItem",
+    "GtkToolbar", "GtkToolButton", "GtkStatusbar", "GtkProgressBar",
+    "GtkAdjustment", "GtkScrolledWindow", "GtkFrame", "GtkAspectFrame",
+    "GtkPaned", "GtkHPaned", "GtkVPaned", "GtkSeparator",
+    "GtkRadioButton", "GtkCheckButton", "GtkToggleButton",
+    "GtkDrawingArea", "GtkScale", "GtkHScale", "GtkVScale",
+    "GtkScrollbar", "GtkHScrollbar", "GtkVScrollbar",
+    "GtkCellRendererText", "GtkCellRendererPixbuf",
+    "GtkTreeIterCompareFunc", "GtkTreeViewColumn",
+    "GdkEventButton", "GdkEventKey", "GdkPixbuf", "GdkColor",
+    "GdkRectangle", "GdkDrawable", "GdkGC", "GdkPixmap",
+)
+
+
+def _needs_gtk_injection(text: str) -> bool:
+    """Heuristic: return True if ``text`` uses GTK/GDK type names but
+    does not already contain the typedefs that the fake ``gtk/gtk.h``
+    would have provided.
+
+    We look for:
+      * any of the known GTK/GDK type names appearing as a whole word
+        (so ``GtkWidget_xxx`` does NOT match), AND
+      * absence of the marker line ``typedef struct _GtkWidget GtkWidget;``
+        which is the first typedef in the fake gtk/gtk.h.  If that
+        typedef is already present the user (or another header) has
+        already pulled in the fake GTK definitions, so we don't need
+        to inject it again.
+    """
+    # Quick reject: if the text already has the fake gtk.h typedefs,
+    # we don't need to inject.
+    if "typedef struct _GtkWidget GtkWidget;" in text:
+        return False
+    # Quick reject: text too small to plausibly use GTK.
+    if len(text) < 100:
+        return False
+    # Look for any known GTK/GDK type name as a whole word.
+    for name in _GTK_TYPE_NAMES:
+        # Word-boundary check using a regex so that ``GtkWidgetFoo``
+        # or ``myGtkWidget`` don't false-trigger.
+        if re.search(rf"\b{re.escape(name)}\b", text):
+            return True
+    return False
+
+
+def _inject_missing_gtk_typedefs(text: str) -> str:
+    """Scan ``text`` for ``Gtk*`` / ``Gdk*`` identifiers used as type
+    names and emit placeholder typedefs for any that are not already
+    defined.
+
+    The fake ``gtk/gtk.h`` only covers the most common widget types.
+    Real GTK apps reference many more typedefs (GtkTreeModelForeachFunc,
+    GtkTreeIterCompareFunc, GdkEventMotion, GtkAccelGroup, GtkCssSection,
+    ...) that are too numerous to enumerate by hand.  Without them,
+    pycparser fails with ``Invalid declaration`` at the first unknown
+    type and the whole AST parse aborts, leaving the converter to fall
+    back to the pattern-based extractor (which only finds ~half the
+    functions in opgui.c).
+
+    We work around this by:
+      1. Collecting every ``typedef ... NAME ...`` line in ``text``
+         and adding NAME to a "defined" set.
+      2. Scanning for word-boundary identifiers starting with ``Gtk``
+         or ``Gdk`` that are NOT in the defined set.
+      3. Prepending a single ``typedef struct _<NAME> <NAME>;`` line
+         for each one, so pycparser sees them as opaque struct types.
+
+    Function-pointer typedefs (``GtkTreeModelForeachFunc``) are
+    emitted as ``typedef int (*NAME)(void);`` so they can also appear
+    in cast expressions like ``(GtkTreeModelForeachFunc)func``.
+
+    The placeholder typedefs are wrapped in a comment block so a human
+    reading the preprocessed text can see why they exist.
+    """
+    if not text:
+        return text
+    # Collect every name already typedef'd in the text so we don't
+    # duplicate.  We look for both ``typedef struct _X X;`` (struct
+    # typedefs) and ``typedef <stuff> NAME;`` (any other typedef).
+    already_defined: set[str] = set()
+    for m in re.finditer(
+        r"typedef\s+(?:struct\s+\w+\s+|[^;{]*\s+)(\w+)\s*[;{]", text
+    ):
+        already_defined.add(m.group(1))
+    # Also collect names from the simpler ``typedef <name>;`` form
+    # (e.g. ``typedef int gboolean;``).
+    for m in re.finditer(r"typedef\s+[^;{}]*\s+(\w+)\s*;", text):
+        already_defined.add(m.group(1))
+    # Find all Gtk*/Gdk*/G-prefixed identifiers used as whole words.
+    # We match identifiers starting with:
+    #   * ``Gtk`` or ``Gdk`` followed by an uppercase letter and then
+    #     any mix of alphanumerics (GtkWidget, GtkTreeIter, GdkEventButton,
+    #     GtkTreeModelForeachFunc, ...).  These are GTK/GDK type names.
+    #   * ``G`` followed by an uppercase letter, then a *lowercase* letter
+    #     (GObject, GList, GSList, GSourceFunc, GCallback, ...).  These
+    #     are GLib type names.  We require the third character to be a
+    #     lowercase letter so all-caps constants like ``GROUP_ALL`` or
+    #     ``G_PI`` (math constant) are not mistaken for type names.
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"\b(G[A-Za-z0-9_]+)\b", text):
+        name = m.group(1)
+        is_gtk_type = (
+            name.startswith("Gtk")
+            or name.startswith("Gdk")
+            or (
+                len(name) >= 3
+                and name[0] == "G"
+                and name[1].isupper()
+                and name[2].islower()
+            )
+        )
+        if not is_gtk_type:
+            continue
+        if name in already_defined or name in seen:
+            continue
+        seen.add(name)
+        candidates.append(name)
+    if not candidates:
+        return text
+    # Emit placeholder typedefs.  We use a single forward declaration
+    # block prepended to the text.  Each entry is one of:
+    #   typedef struct _GtkFoo GtkFoo;        (struct typedef)
+    # or, for names ending in common function-pointer suffixes, a
+    # function-pointer typedef so they can be used in casts.
+    #
+    # IMPORTANT: we must NOT wrap the typedefs in a ``/* ... */``
+    # comment block.  pycparser does not support C comments in its
+    # input (see https://github.com/eliben/pycparser#3using), so a
+    # comment block at the start of the text would cause the whole
+    # parse to abort with "Comments are not supported".  We use
+    # ``//`` line comments instead, which pycparser also rejects,
+    # so we simply omit any human-readable marker.
+    func_ptr_suffixes = ("Func", "Callback", "Notify", "Destroy")
+    lines: list[str] = []
+    for name in candidates:
+        if any(name.endswith(suf) for suf in func_ptr_suffixes):
+            # Function-pointer typedef.  We use ``int (*)(void)`` as
+            # a generic placeholder so the type can appear in both
+            # variable declarations and cast expressions.
+            lines.append(f"typedef int (*{name})(void);")
+        else:
+            # Struct typedef.  We use ``struct _<NAME>`` as the tag
+            # so the typedef does not conflict with any later real
+            # definition of the same struct.
+            lines.append(f"typedef struct _{name} {name};")
+    return "\n".join(lines) + "\n" + text
+
+
 def is_available() -> bool:
     """Return True if pcpp is importable."""
     return _HAS_PCPP
+
+
+def _read_all_fake_headers(fake_include_dir: str) -> str:
+    """Concatenate every ``.h`` file under ``fake_include_dir`` into a
+    single string so it can be prepended to the preprocessed text.
+
+    This guarantees every typedef/struct the user's code might
+    reference is in scope for pycparser, even if the source did not
+    explicitly ``#include`` the corresponding system header.  We walk
+    the directory recursively so subdirectories like ``gtk/`` and
+    ``sys/`` are picked up too.
+
+    Returns the concatenated text, or "" if the directory is empty or
+    unreadable.  Each header's content is separated by a newline so
+    the last line of one header doesn't run into the first line of
+    the next.
+
+    IMPORTANT: we strip every ``#``-prefixed preprocessor directive
+    (``#ifndef``, ``#define``, ``#endif``, ``#include``, ...) from
+    the concatenated text before returning it.  pycparser does not
+    support preprocessor directives in its input (it expects already-
+    preprocessed text), so leaving them in would abort the parse
+    with "Directives not supported yet".
+    """
+    if not fake_include_dir or not os.path.isdir(fake_include_dir):
+        return ""
+    chunks: list[str] = []
+    for root, _dirs, files in os.walk(fake_include_dir):
+        for fname in sorted(files):
+            if not fname.endswith(".h"):
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8",
+                          errors="replace") as f:
+                    chunks.append(f.read())
+            except OSError:
+                continue
+    raw = "\n".join(chunks)
+    # Strip preprocessor directives so pycparser can parse the text.
+    # We replace each directive line with a blank line to preserve
+    # line numbering (in case any coord.line references point into
+    # the fake header region — they'll still resolve to a sensible
+    # line, just an empty one).
+    cleaned_lines = []
+    for line in raw.splitlines():
+        if line.lstrip().startswith("#"):
+            cleaned_lines.append("")
+        else:
+            cleaned_lines.append(line)
+    return "\n".join(cleaned_lines)

@@ -108,6 +108,135 @@ except ImportError:
     _HAS_PYCPARSER = False
 
 
+import re as _re
+
+
+def _extract_missing_type_from_error(err_msg: str) -> str:
+    """Extract the undefined type name from a pycparser ParseError
+    message so we can emit a placeholder typedef and retry.
+
+    pycparser's ParseError messages come in these flavours:
+
+      1. ``"<file>:line:col: before: <ident>"`` — pycparser hit an
+         identifier it doesn't know and is telling us what it was
+         looking at when it bailed.  The identifier is the LAST
+         whitespace-separated token after ``before:``.
+
+      2. ``"<file>:line:col: Missing type in declaration"`` — the
+         parser hit a declaration whose type specifier was a macro
+         that got stripped (because we're on the raw-source fallback
+         path).  pycparser doesn't name the identifier in this case,
+         so we have to fall back to "guess and retry" — return a
+         sentinel so the caller knows to emit an ``int`` typedef.
+
+      3. ``"<file>:line: Non-typedef 'X' previously declared..."``
+         — the error names a specific identifier.  We return it.
+
+    Returns the extracted identifier (stripped of punctuation) or "".
+    """
+    if not err_msg:
+        return ""
+    # Pattern 1: "before: <ident>"
+    m = _re.search(r"before:\s+(\w+)", err_msg)
+    if m:
+        return m.group(1)
+    # Pattern 2: "Non-typedef 'X' ..."
+    m = _re.search(r"Non-typedef '(\w+)'", err_msg)
+    if m:
+        return m.group(1)
+    # Pattern 3: "Missing type in declaration" — we don't know the
+    # name, but the caller will look at the error line in the source
+    # to find the offending variable.  We return a sentinel so the
+    # caller's retry loop continues.
+    if "Missing type" in err_msg:
+        # Try to extract the variable name from the error line number.
+        # Format: "<file>:line:col: Missing type in declaration"
+        m = _re.search(r":(\d+):(\d+):\s*Missing type", err_msg)
+        if m:
+            return f"__MISSING_TYPE_LINE_{m.group(1)}__"
+    return ""
+
+
+def _read_and_inline_local_headers(c_path: str) -> str:
+    """Read a .c file and inline every local ``#include "..."`` header
+    so pycparser can parse the result without a real preprocessor.
+
+    This is the last-resort preprocessing path used when both pcpp
+    and gcc are unavailable (the common case on Windows).  We:
+
+      1. Read the .c source.
+      2. Walk every line; when we see ``#include "name.h"`` (note the
+         double quotes — that signals a LOCAL include, not a system
+         include), we look for ``name.h`` in the same directory as
+         the .c file and recursively inline its contents.  System
+         includes (``#include <name.h>``) are dropped — the fake
+         headers prepended later provide the typedefs.
+      3. Strip every other preprocessor directive (``#define``,
+         ``#ifdef``, ``#if``, ``#endif``, ``#pragma``, ...).
+      4. Strip C block comments (``/* ... */``) and line comments
+         (``// ...``) so pycparser doesn't abort with "Comments are
+         not supported".
+
+    Macro expansion (#define X Y) is NOT performed — we simply drop
+    the directives.  This means code that relies on macro expansion
+    will not parse correctly, but for the opgui codebase (which
+    mostly uses #define for constants and includes) this is good
+    enough to extract all function signatures and bodies.
+
+    The result is a single string ready to be passed to pycparser
+    (after the fake-header blob is prepended by the caller).
+    """
+    src_dir = os.path.dirname(os.path.abspath(c_path))
+    seen_includes: set[str] = set()
+
+    def _read_with_includes(path: str, depth: int = 0) -> str:
+        if depth > 10:
+            return ""  # avoid infinite recursion on circular includes
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError:
+            return ""
+        out_lines: list[str] = []
+        for line in content.splitlines():
+            stripped = line.lstrip()
+            # Local include: #include "name.h"
+            m = _re.match(r'#\s*include\s+"([^"]+)"', stripped)
+            if m:
+                inc_name = m.group(1)
+                inc_path = os.path.join(src_dir, inc_name)
+                # Avoid inlining the same header twice
+                inc_abs = os.path.abspath(inc_path)
+                if inc_abs in seen_includes:
+                    out_lines.append("")  # preserve line numbering
+                    continue
+                seen_includes.add(inc_abs)
+                if os.path.isfile(inc_path):
+                    inlined = _read_with_includes(inc_path, depth + 1)
+                    out_lines.append(inlined)
+                else:
+                    out_lines.append("")  # header not found — skip
+                continue
+            # System include: #include <name.h> — drop it; fake headers
+            # provide the typedefs.
+            if _re.match(r'#\s*include\s+<[^>]+>', stripped):
+                out_lines.append("")
+                continue
+            # Any other preprocessor directive — drop it.
+            if stripped.startswith("#"):
+                out_lines.append("")
+                continue
+            out_lines.append(line)
+        raw = "\n".join(out_lines)
+        # Strip block comments (/* ... */) across multiple lines.
+        raw = _re.sub(r"/\*.*?\*/", "", raw, flags=_re.DOTALL)
+        # Strip line comments (// ...).
+        raw = _re.sub(r"//[^\n]*", "", raw)
+        return raw
+
+    return _read_with_includes(c_path)
+
+
 # ---------------------------------------------------------------------------
 # Type translation: pycparser AST type nodes → Pascal type strings
 # ---------------------------------------------------------------------------
@@ -523,8 +652,29 @@ class AstToPascal:
             return False
         text = None
         # ---- Try pcpp (pure Python) first ----
+        # pcpp is REQUIRED for AST parsing on Windows (where gcc is not
+        # installed by default).  If pcpp is not installed, we try to
+        # install it automatically via pip so the user does not need to
+        # manually run ``pip install pcpp`` before the first conversion.
+        # This auto-install only happens once per session.
         try:
             from pcpp_preprocessor import preprocess, is_available
+            if not is_available():
+                import subprocess as _subprocess
+                import sys as _sys
+                try:
+                    _subprocess.run(
+                        [_sys.executable, "-m", "pip", "install",
+                         "pcpp", "--quiet"],
+                        check=False, timeout=120,
+                        capture_output=True,
+                    )
+                    # Force re-import after install
+                    import importlib
+                    import pcpp_preprocessor as _pp
+                    importlib.reload(_pp)
+                except Exception:
+                    pass
             if is_available():
                 text = preprocess(self.c_path,
                                   fake_include_dir=self.fake_include_dir)
@@ -560,18 +710,139 @@ class AstToPascal:
                     if not text.strip():
                         self.parse_error = proc.stderr.decode("utf-8",
                                                                errors="replace")
-                        return False
+                        # Don't return False yet — fall through to the
+                        # "raw source" fallback below so we still get a
+                        # best-effort AST parse with fake headers injected.
+                        text = None
             except Exception as e:
                 self.parse_error = f"both pcpp and gcc failed: {e}"
+                # Don't return False yet — fall through to the
+                # "raw source" fallback below so we still get a
+                # best-effort AST parse with fake headers injected.
+                text = None
+        # ---- Last-resort fallback: use the raw C source text if both
+        # pcpp and gcc failed (or gcc is not installed, which is the
+        # common case on Windows).  We strip preprocessor directives
+        # (#include, #define, #ifdef, ...) ourselves, INLINES every
+        # local #include "..." header (so typedefs/structs declared in
+        # sibling .h files are visible to pycparser), and rely on the
+        # fake-header injection below to provide every system typedef
+        # the source might reference.  This is less accurate than a
+        # real preprocessor pass (no macro expansion) but it still
+        # lets pycparser extract function signatures and bodies from
+        # the .c file, which is enough for the converter to produce a
+        # useful .pas unit.  Without this fallback the whole .c file's
+        # AST parse returns None and the converter falls back to the
+        # pattern-based extractor, which only finds ~half the
+        # functions in opgui.c.
+        if not text or not text.strip():
+            try:
+                text = _read_and_inline_local_headers(self.c_path)
+                if not self.parse_error:
+                    self.parse_error = (
+                        "used raw source (pcpp and gcc both unavailable)"
+                    )
+            except Exception as e:
+                self.parse_error = f"failed to read source: {e}"
                 return False
+        # ---- Always prepend ALL fake system headers so pycparser sees
+        # every typedef/struct the user's code might reference, even
+        # if the source did not #include the corresponding system header.
+        # This mirrors the logic in pcpp_preprocessor.preprocess() so
+        # the gcc -E path is also covered.
+        try:
+            from pcpp_preprocessor import (
+                _read_all_fake_headers, _inject_missing_gtk_typedefs,
+            )
+        except Exception:
+            _read_all_fake_headers = None
+            _inject_missing_gtk_typedefs = None
+        if text and _read_all_fake_headers:
+            fake_blob = _read_all_fake_headers(self.fake_include_dir)
+            if fake_blob:
+                text = fake_blob + "\n" + text
+        # Always run the placeholder-typedef injection so any Gtk*/Gdk*
+        # names not covered by the fake headers still resolve to stubs.
+        if text and _inject_missing_gtk_typedefs:
+            text = _inject_missing_gtk_typedefs(text)
         # ---- Parse the preprocessed text with pycparser ----
         try:
             from pycparser import CParser
             parser = CParser()
             ast = parser.parse(text, filename=self.c_path)
         except Exception as e:
-            self.parse_error = str(e)
-            return False
+            # pycparser raises ParseError when it hits an undefined type
+            # name (e.g. ``fd_set``, ``struct timespec``, ...) or a
+            # missing type in a declaration (e.g. when a #define that
+            # expands to a type was stripped because we're on the raw
+            # source fallback path).  We try to recover by parsing
+            # the error message for the offending identifier, emitting
+            # a placeholder typedef for it, and re-parsing.  We retry
+            # up to 10 times so a chain of missing types
+            # (``fd_set`` -> ``timeval`` -> ``port`` -> ...) can be
+            # resolved in one go.
+            ast = None
+            err_msg = str(e)
+            self.parse_error = err_msg
+            for _ in range(10):
+                missing = _extract_missing_type_from_error(err_msg)
+                if not missing:
+                    break
+                # "Missing type in declaration" — the missing name is a
+                # sentinel like ``__MISSING_TYPE_LINE_<N>__``.  We look
+                # up line <N> in the source text and extract the first
+                # identifier that looks like a variable name, then emit
+                # an ``int`` typedef for it.
+                if missing.startswith("__MISSING_TYPE_LINE_"):
+                    line_num_str = missing[len("__MISSING_TYPE_LINE_"):-2]
+                    try:
+                        line_num = int(line_num_str)
+                        src_lines = text.splitlines()
+                        if 0 < line_num <= len(src_lines):
+                            err_line = src_lines[line_num - 1]
+                            # Extract the first identifier that could be
+                            # a variable name (alphanumeric, starts with
+                            # a letter or underscore).
+                            m_id = _re.search(
+                                r"\b([A-Za-z_]\w*)\s*[=;\[,\)]", err_line
+                            )
+                            if m_id:
+                                var_name = m_id.group(1)
+                                text = f"typedef int {var_name};\n" + text
+                                # Re-parse and continue the retry loop.
+                                try:
+                                    parser2 = CParser()
+                                    ast = parser2.parse(text,
+                                                        filename=self.c_path)
+                                    self.parse_error = ""
+                                    break
+                                except Exception as e2:
+                                    err_msg = str(e2)
+                                    self.parse_error = err_msg
+                                    continue
+                    except (ValueError, IndexError):
+                        pass
+                    # If we couldn't extract a variable name, stop
+                    # retrying to avoid an infinite loop.
+                    break
+                # Normal case: ``before: <ident>`` or ``Non-typedef 'X'``
+                # Prepend a placeholder typedef for the missing type so
+                # pycparser can resolve it on the next attempt.
+                if "Missing type" in err_msg:
+                    text = f"typedef int {missing};\n" + text
+                else:
+                    text = f"typedef struct _{missing} {missing};\n" + text
+                try:
+                    parser2 = CParser()
+                    ast = parser2.parse(text, filename=self.c_path)
+                    self.parse_error = ""
+                    break
+                except Exception as e2:
+                    err_msg = str(e2)
+                    self.parse_error = err_msg
+                    continue
+            if ast is None:
+                return False
         # Filter: only keep top-level nodes whose coord.file matches our
         # source file (skip nodes coming from fake headers).
         target = os.path.basename(self.c_path)
@@ -1592,6 +1863,22 @@ class AstBodyTranslator:
 
     def _expr_Constant(self, node) -> str:
         val = node.value
+        # String literal: pycparser tags string constants with type='string'
+        # and value still wrapped in the original double quotes.  We strip
+        # the quotes and process C escape sequences:
+        #   \n  -> ' + NL + '   (single LF, matches the C ``#define NL "\n"``
+        #                        macro used throughout opgui/strings.c)
+        #   \t  -> ' + #9 + '
+        #   \r  -> ' + #13 + '
+        #   \0  -> ' + #0 + '
+        #   \"  -> "
+        #   \'  -> ''
+        #   \\  -> \
+        # Note: this MUST be done before the hex/char/float branches below
+        # because a string literal's first character can be ``'`` (when the
+        # C source uses ``"'"``) and would otherwise be mistaken for a char.
+        if getattr(node, "type", None) == "string":
+            return self._convert_c_string_literal(val)
         # Hex literal
         if val.startswith("0x") or val.startswith("0X"):
             return f"${val[2:]}"
@@ -1619,6 +1906,54 @@ class AstBodyTranslator:
         if val.endswith("U") or val.endswith("u"):
             val = val[:-1]
         return val
+
+    @staticmethod
+    def _convert_c_string_literal(val: str) -> str:
+        """Translate a C double-quoted string literal (as exposed by
+        pycparser's ``Constant.value``) into a Pascal string expression.
+
+        Embedded ``\\n`` is split out as ``' + NL + '`` so the generated
+        source reads the way opgui's strings.c declares multi-line
+        strings (the converted unit emits ``const NL = #10;`` up front).
+        Standalone ``"\\n"`` collapses to the bare ``NL`` symbol rather
+        than ``'' + NL + ''`` so that ``strings_en[S_NL] := NL;`` matches
+        the original C intent of ``strings_en[S_NL] = NL;``.
+        """
+        # pycparser stores the value with the surrounding double quotes
+        # intact, and the escape sequences as raw backslash-pairs (e.g.
+        # the Python string ``"hello\\nworld"`` — note the double backslash
+        # — represents the C source ``"hello\nworld"``).
+        if not (val.startswith('"') and val.endswith('"') and len(val) >= 2):
+            # Defensive: shouldn't happen for type='string', but be safe.
+            inner = val
+        else:
+            inner = val[1:-1]
+        # Split on \n so each piece becomes a single-quoted Pascal
+        # fragment joined by the NL constant.
+        parts = inner.split('\\n')
+        if len(parts) == 1:
+            # No newline — single Pascal string with other escapes processed
+            s = parts[0]
+            s = s.replace('\\t', "' + #9 + '")
+            s = s.replace('\\r', "' + #13 + '")
+            s = s.replace('\\0', "' + #0 + '")
+            s = s.replace('\\"', '"')
+            s = s.replace("\\'", "''")
+            s = s.replace("\\\\", "\\")
+            return f"'{s}'"
+        if len(parts) == 2 and parts[0] == "" and parts[1] == "":
+            # Standalone "\n" — collapse to the NL constant
+            return "NL"
+        pas_parts = []
+        for p in parts:
+            p = p.replace('\\t', "' + #9 + '")
+            p = p.replace('\\r', "' + #13 + '")
+            p = p.replace('\\0', "' + #0 + '")
+            p = p.replace('\\"', '"')
+            p = p.replace("\\'", "''")
+            p = p.replace("\\\\", "\\")
+            pas_parts.append(f"'{p}'")
+        return " + NL + ".join(pas_parts)
 
     def _expr_ID(self, node) -> str:
         return pascalify_name(node.name)
@@ -1722,8 +2057,14 @@ class AstBodyTranslator:
         return f"IfThen({cond}, {iftrue}, {iffalse})"
 
     def _expr_Constant(self, node) -> str:
-        # (defined above, but keep for safety)
+        # Duplicate handler kept for safety; the primary _expr_Constant
+        # above is what the dispatcher will actually call (Python class
+        # attribute lookup uses the first definition).  Still route string
+        # constants through _convert_c_string_literal so any caller that
+        # happens to invoke this version gets correct behaviour too.
         val = node.value
+        if getattr(node, "type", None) == "string":
+            return self._convert_c_string_literal(val)
         if val.startswith("0x") or val.startswith("0X"):
             return f"${val[2:]}"
         if val.startswith("'") and val.endswith("'") and len(val) >= 3:

@@ -404,9 +404,22 @@ def convert(input_dir: str, output_dir: str,
     for c_path in c_files_sorted:
         _progress(f"Converting C source: {os.path.basename(c_path)}")
         base = os.path.splitext(os.path.basename(c_path))[0].lower()
-        if base == "opgui" and not c_only:
-            # Already represented by the form unit; skip duplicate
-            continue
+        # ---- opgui.c handling ----
+        # The previous code SKIPPED opgui.c in GUI (non-c_only) mode on
+        # the assumption that "the form unit (mainform.pas) already
+        # represents opgui.c".  This is wrong: opgui.c contains dozens
+        # of regular (non-GUI) functions that the form unit does NOT
+        # contain, so skipping opgui.c meant those functions were
+        # silently dropped from the conversion.  The user observed this
+        # as "opgui.pas is generated in CLI mode but not in GUI mode".
+        #
+        # We now ALWAYS convert opgui.c.  In GUI mode, the C-derived
+        # unit is named ``opgui`` (same as the .c file), which is
+        # distinct from the form unit ``mainform``.  Both units coexist
+        # in the project: ``mainform`` holds the LCL form definition
+        # (generated from the .glade file), and ``opgui`` holds the
+        # translated C functions.  This matches how the CLI ``c2pas``
+        # mode already works.
         if base[0].isdigit():
             base = "u" + base
         # Collect header units this C file #includes.
