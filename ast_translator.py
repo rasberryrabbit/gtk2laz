@@ -2041,7 +2041,14 @@ class AstBodyTranslator:
         field = pascalify_name(field)
         if node.type == "->":
             # ptr->field  ->  ptr^.field  (deref then field access)
-            return f"{struct}^{field}"
+            # Pascal pointer dereference uses ``^`` and the field
+            # access uses ``.``, so the full expression is
+            # ``ptr^.field`` (NOT ``ptr^field`` — that would be a
+            # pointer dereference with no field access, which Pascal
+            # does not accept).  The previous code emitted
+            # ``ptr^field`` (missing the dot), producing invalid
+            # Pascal like ``info^family`` instead of ``info^.family``.
+            return f"{struct}^.{field}"
         return f"{struct}.{field}"
 
     def _expr_Cast(self, node) -> str:
