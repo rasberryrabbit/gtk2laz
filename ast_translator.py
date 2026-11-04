@@ -1258,6 +1258,11 @@ class AstBodyTranslator:
         # the buffer (with the current pad) before appending its own
         # line, so the pre-statements appear in the right place.
         self._pre_lines: list[str] = []
+        # Post-statements: similar to pre-statements but emitted AFTER
+        # the current statement. Used for C post-increment in read
+        # context (``*ptr++`` reads ptr^ then advances ptr — the Inc
+        # must happen AFTER the value is used, not before).
+        self._post_lines: list[str] = []
 
     # ------------------------------------------------------------------
     def translate(self) -> list[str]:
@@ -1276,6 +1281,7 @@ class AstBodyTranslator:
         # final statement is an expression-statement that produced
         # pre-statements but had no trailing ``_emit`` call of its own).
         self._flush_pre()
+        self._flush_post()
         return self.lines
 
     # ------------------------------------------------------------------
@@ -1288,6 +1294,13 @@ class AstBodyTranslator:
         Flush happens automatically the next time ``_emit`` is called."""
         self._pre_lines.append(text)
 
+    def _emit_post(self, text: str) -> None:
+        """Record a side-effect statement (e.g. ``Inc(ptr)`` for
+        ``*ptr++``) that must run *after* the surrounding expression
+        statement. Flush happens automatically the next time ``_emit``
+        or ``_emit_todo`` is called."""
+        self._post_lines.append(text)
+
     def _flush_pre(self) -> None:
         """Emit any pending pre-statements at the current indent.
         Called by ``_emit`` and ``_emit_todo`` before they append."""
@@ -1295,24 +1308,35 @@ class AstBodyTranslator:
             return
         pad = self._pad()
         for line in self._pre_lines:
-            # Pre-statements are stored as ``text;`` (with trailing
-            # semicolon). Indent them at the current level so they
-            # appear alongside the statement that consumes them.
             self.lines.append(f"{pad}{line}")
             self._pas_line += 1
             self.translated_count += 1
         self._pre_lines = []
+
+    def _flush_post(self) -> None:
+        """Emit any pending post-statements at the current indent.
+        Called by ``_emit`` and ``_emit_todo`` after they append."""
+        if not self._post_lines:
+            return
+        pad = self._pad()
+        for line in self._post_lines:
+            self.lines.append(f"{pad}{line}")
+            self._pas_line += 1
+            self.translated_count += 1
+        self._post_lines = []
 
     def _emit(self, text: str) -> None:
         self._flush_pre()
         self.lines.append(text)
         self._pas_line += 1
         self.translated_count += 1
+        self._flush_post()
 
     def _emit_todo(self, node, reason: str = "") -> None:
         """Emit a multi-line TODO comment for an AST node we can't
         translate. Uses the node's coord for accurate source line."""
         self._flush_pre()
+        self._flush_post()
         self.todo_count += 1
         pad = self._pad()
         body_pad = pad + "  "
@@ -2376,13 +2400,44 @@ class AstBodyTranslator:
                 return f"@{operand}"
             return f"@({operand})"
         if op == "*":
+            # Special case: *(ptr++) — dereference then increment.
+            # C: ``*ptr++`` reads *ptr (current value), THEN advances
+            # ptr. Post-increment means the increment happens AFTER
+            # the value is used.
+            # Pascal: we return ``ptr^`` (the current value) and emit
+            # ``Inc(ptr)`` as a POST-statement so it runs after the
+            # surrounding expression statement.
+            # Without this, ``Inc(ptr)^`` is invalid Pascal, and using
+            # _emit_pre would increment BEFORE reading (wrong order).
+            if isinstance(node.expr, c_ast.UnaryOp) \
+                    and node.expr.op in ("p++", "p--"):
+                ptr = self._translate_expr(node.expr.expr)
+                if "++" in node.expr.op:
+                    self._emit_post(f"Inc({ptr});")
+                else:
+                    self._emit_post(f"Dec({ptr});")
+                return f"{ptr}^"
             return f"{operand}^"
         if op in ("p++", "p--", "++", "--"):
-            # As expression, this is semantically wrong (pre/post
-            # increment returns a value in C). Emit Inc/Dec call but
-            # flag it - the user must verify.
+            # Post-increment (p++) / pre-increment (++) as expression.
+            # C: ``x = y++`` assigns the current value of y to x, then
+            # increments y. ``x = ++y`` increments y first, then
+            # assigns the new value.
+            # Pascal: neither Inc nor Dec returns a value, so we
+            # cannot use them as expressions. We use _emit_post to
+            # emit the Inc/Dec AFTER the surrounding statement (for
+            # post-increment) or _emit_pre to emit it BEFORE (for
+            # pre-increment), and return the operand itself as the
+            # "value" of the expression.
             sub_op = "Inc" if "++" in op else "Dec"
-            return f"{sub_op}({operand})"
+            # post-increment (p++): Inc/Dec AFTER the statement
+            if op in ("p++", "p--"):
+                self._emit_post(f"{sub_op}({operand});")
+                return operand
+            # pre-increment (++): Inc/Dec BEFORE the statement
+            else:
+                self._emit_pre(f"{sub_op}({operand});")
+                return operand
         if op == "sizeof":
             return f"SizeOf({operand})"
         return f"({op} {operand})"
