@@ -256,11 +256,28 @@ def _type_to_pascal(typ) -> str:
     # PtrDecl: pointer to something
     if isinstance(typ, c_ast.PtrDecl):
         inner = _type_to_pascal(typ.type)
+        # void* → Pointer (not ^Pointer). In Pascal, ``Pointer`` is
+        # an untyped pointer, which is the direct equivalent of C's
+        # ``void *``. Using ``^Pointer`` would be syntactically valid
+        # but semantically wrong — it implies a pointer TO a pointer.
+        if inner == "Pointer":
+            return "Pointer"
         # char* -> PChar
         if inner in ("Char", "PChar"):
             return "PChar"
         if inner == "Byte":
             return "PByte"
+        # Use P-prefix convention for pointer types (same as
+        # widget_map.c_type_to_pascal and HeaderTranslator):
+        #   ^TSomeRecord  → PSomeRecord
+        #   ^TENetSymbol  → PENetSymbol
+        #   ^TENetHost    → PENetHost
+        # This matches the pointer-type aliases we auto-generate
+        # for every struct/enum/union typedef.
+        if inner.startswith("T") and len(inner) > 1 and inner[1].isupper():
+            return _make_pointer_name(inner)
+        # For non-T types (Integer, Pointer, etc.), keep ^Inner
+        # since there is no P-prefix alias defined for them.
         return f"^{inner}"
     # ArrayDecl: array of something
     if isinstance(typ, c_ast.ArrayDecl):
@@ -568,11 +585,43 @@ def _struct_typedef_to_pas(name: str, struct_node) -> AstTypeDef:
             fname = pascalify_name(f.name or "field")
             ftype = _type_to_pascal(f.type)
             fields.append(f"    {fname}: {ftype};")
+    # Build the record declaration AND an auto-generated pointer-type
+    # alias (``P<Name> = ^T<Name>``). The pointer alias lets the
+    # converter use ``PName`` instead of ``^TName`` for pointer-to-
+    # struct types, which is the idiomatic Pascal convention. This
+    # also matches what the HeaderTranslator does for .h files.
+    lines: list[str] = []
     if fields:
-        body = f"  {pas_name} = record\n" + "\n".join(fields) + "\n  end;"
+        lines.append(f"  {pas_name} = record")
+        lines.extend(fields)
+        lines.append("  end;")
     else:
-        body = f"  {pas_name} = record\n    (* empty struct *)\n  end;"
+        lines.append(f"  {pas_name} = record")
+        lines.append("    (* empty struct *)")
+        lines.append("  end;")
+    # Auto-generate pointer alias: TSomeRecord → PSomeRecord,
+    # TENetSymbol → PENetSymbol.
+    ptr_name = _make_pointer_name(pas_name)
+    lines.append(f"  {ptr_name} = ^{pas_name};")
+    body = "\n".join(lines)
     return AstTypeDef(name=name, kind="struct", pascal_decl=body)
+
+
+def _make_pointer_name(pas_name: str) -> str:
+    """Convert a Pascal type name to its pointer-type alias name.
+
+    Convention:
+      TSomeRecord → PSomeRecord  (strip T, prepend P)
+      TENetSymbol → PENetSymbol  (strip T, prepend P)
+      SomeType    → PSomeType    (no T to strip, just prepend P)
+
+    This matches the convention used by FreePascal/LCL's own
+    pointer types (PInteger, PByte, PChar, etc.).
+    """
+    if pas_name.startswith("T") and len(pas_name) > 1 \
+            and pas_name[1].isupper():
+        return "P" + pas_name[1:]
+    return "P" + pas_name
 
 
 def _enum_typedef_to_pas(name: str, enum_node) -> AstTypeDef:
@@ -582,19 +631,51 @@ def _enum_typedef_to_pas(name: str, enum_node) -> AstTypeDef:
         for v in enum_node.values.enumerators:
             mname = pascalify_name(v.name)
             members.append(mname)
+    lines: list[str] = []
     if members:
-        body = f"  {pas_name} = ({', '.join(members)});"
+        lines.append(f"  {pas_name} = ({', '.join(members)});")
     else:
-        body = f"  (* empty enum {pas_name} *)"
+        lines.append(f"  (* empty enum {pas_name} *)")
+    # Auto-generate pointer alias for enums too (same convention).
+    ptr_name = _make_pointer_name(pas_name)
+    lines.append(f"  {ptr_name} = ^{pas_name};")
+    body = "\n".join(lines)
     return AstTypeDef(name=name, kind="enum", pascal_decl=body)
 
 
 def _union_typedef_to_pas(name: str, union_node) -> AstTypeDef:
-    pas_name = _pascalize_type("union_" + name)
-    # Unions become variant records in Pascal - too complex for stage 1.
-    return AstTypeDef(name=name, kind="union",
-                      pascal_decl=f"  (* TODO gtk2laz: union {pas_name} - "
-                                  "convert to variant record by hand *)")
+    pas_name = _pascalize_type(name)
+    # C unions map to Pascal variant records, but variant records
+    # require a case tag which the C union does not have. We convert
+    # the union to a Pascal record with all fields listed (same as
+    # the HeaderTranslator does for .h files) and emit a comment
+    # so the user knows to convert it to a proper variant record by
+    # hand. This matches the HeaderTranslator's behaviour so the
+    # .h and .c outputs are consistent.
+    lines: list[str] = []
+    lines.append(f"  // C union — consider converting to Pascal "
+                 f"variant record (case of).")
+    fields: list[str] = []
+    if union_node.decls:
+        for f in union_node.decls:
+            if not isinstance(f, c_ast.Decl):
+                continue
+            fname = pascalify_name(f.name or "field")
+            ftype = _type_to_pascal(f.type)
+            fields.append(f"    {fname}: {ftype};")
+    if fields:
+        lines.append(f"  {pas_name} = record")
+        lines.extend(fields)
+        lines.append("  end;")
+    else:
+        lines.append(f"  {pas_name} = record")
+        lines.append("    (* empty union *)")
+        lines.append("  end;")
+    # Auto-generate pointer alias (same as struct/enum).
+    ptr_name = _make_pointer_name(pas_name)
+    lines.append(f"  {ptr_name} = ^{pas_name};")
+    body = "\n".join(lines)
+    return AstTypeDef(name=name, kind="union", pascal_decl=body)
 
 
 _PASCAL_KEYWORDS = {
@@ -622,12 +703,14 @@ class AstToPascal:
     def __init__(self, c_path: str, unit_name: str,
                  fake_include_dir: str = "/tmp/fake_libc_include",
                  form_unit: Optional[str] = None,
-                 included_units: list[str] = None):
+                 included_units: list[str] = None,
+                 target_platform: str = "auto"):
         self.c_path = c_path
         self.unit_name = unit_name
         self.fake_include_dir = fake_include_dir
         self.form_unit = form_unit
         self.included_units = list(included_units or [])
+        self.target_platform = target_platform or "auto"
         self.parse_error: Optional[str] = None
         self.functions: list[AstFunction] = []
         self.globals: list[AstGlobal] = []
@@ -649,8 +732,11 @@ class AstToPascal:
         """
         if not _HAS_PYCPARSER:
             self.parse_error = "pycparser not installed"
+            print(f"gtk2laz: pycparser NOT installed — cannot parse "
+                  f"{os.path.basename(self.c_path)}", file=sys.stderr)
             return False
         text = None
+        _src_basename = os.path.basename(self.c_path)
         # ---- Try pcpp (pure Python) first ----
         # pcpp is REQUIRED for AST parsing on Windows (where gcc is not
         # installed by default).  If pcpp is not installed, we try to
@@ -660,6 +746,14 @@ class AstToPascal:
         try:
             from pcpp_preprocessor import preprocess, is_available
             if not is_available():
+                # pcpp is not installed. On a PyInstaller-frozen build
+                # we CANNOT ``pip install`` at runtime (the bundle is
+                # read-only), so the auto-install attempt below is
+                # effectively a no-op. We still try it for the
+                # source-distribution case (running from a clone).
+                print(f"gtk2laz: pcpp not installed — attempting "
+                      f"auto-install (will fail in frozen build)",
+                      file=sys.stderr)
                 import subprocess as _subprocess
                 import sys as _sys
                 try:
@@ -676,12 +770,35 @@ class AstToPascal:
                 except Exception:
                     pass
             if is_available():
+                print(f"gtk2laz: [{_src_basename}] trying pcpp "
+                      f"preprocessing...", file=sys.stderr)
                 text = preprocess(self.c_path,
-                                  fake_include_dir=self.fake_include_dir)
-        except Exception:
+                                  fake_include_dir=self.fake_include_dir,
+                                  target_platform=self.target_platform)
+                if text and text.strip():
+                    print(f"gtk2laz: [{_src_basename}] pcpp OK — "
+                          f"{len(text)} bytes of preprocessed text",
+                          file=sys.stderr)
+                else:
+                    # pcpp returned empty output. This usually means
+                    # pcpp silently failed inside ``preprocess()`` —
+                    # the inner function already printed a diagnostic
+                    # to stderr, so here we just note it.
+                    print(f"gtk2laz: [{_src_basename}] pcpp produced "
+                          f"no output — falling back to gcc/raw-source "
+                          f"path", file=sys.stderr)
+            else:
+                print(f"gtk2laz: [{_src_basename}] pcpp still not "
+                      f"available after auto-install attempt",
+                      file=sys.stderr)
+        except Exception as _e:
+            print(f"gtk2laz: [{_src_basename}] pcpp preprocess() "
+                  f"raised {type(_e).__name__}: {_e}", file=sys.stderr)
             text = None
         # ---- Fall back to gcc -E if pcpp unavailable or failed ----
         if not text or not text.strip():
+            print(f"gtk2laz: [{_src_basename}] trying gcc -E "
+                  f"fallback...", file=sys.stderr)
             import subprocess
             cpp_args = ["gcc", "-E", "-nostdinc",
                         f"-I{self.fake_include_dir}",
@@ -705,16 +822,34 @@ class AstToPascal:
                                        check=False, timeout=60)
                 # Decode with errors='replace' so non-UTF-8 bytes don't crash
                 text = proc.stdout.decode("utf-8", errors="replace")
-                if proc.returncode != 0:
+                if proc.returncode == 0 and text.strip():
+                    print(f"gtk2laz: [{_src_basename}] gcc -E OK — "
+                          f"{len(text)} bytes", file=sys.stderr)
+                else:
                     # Preprocessor failed - check if we still got partial output
                     if not text.strip():
                         self.parse_error = proc.stderr.decode("utf-8",
                                                                errors="replace")
+                        print(f"gtk2laz: [{_src_basename}] gcc -E "
+                              f"failed (rc={proc.returncode}): "
+                              f"{self.parse_error[:200]}", file=sys.stderr)
                         # Don't return False yet — fall through to the
                         # "raw source" fallback below so we still get a
                         # best-effort AST parse with fake headers injected.
                         text = None
+                    else:
+                        print(f"gtk2laz: [{_src_basename}] gcc -E "
+                              f"partial output (rc={proc.returncode}) — "
+                              f"{len(text)} bytes", file=sys.stderr)
+            except FileNotFoundError:
+                print(f"gtk2laz: [{_src_basename}] gcc not found on "
+                      f"PATH — trying raw-source fallback",
+                      file=sys.stderr)
+                self.parse_error = "gcc not found"
+                text = None
             except Exception as e:
+                print(f"gtk2laz: [{_src_basename}] gcc -E raised "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
                 self.parse_error = f"both pcpp and gcc failed: {e}"
                 # Don't return False yet — fall through to the
                 # "raw source" fallback below so we still get a
@@ -736,13 +871,24 @@ class AstToPascal:
         # pattern-based extractor, which only finds ~half the
         # functions in opgui.c.
         if not text or not text.strip():
+            print(f"gtk2laz: [{_src_basename}] using raw-source "
+                  f"fallback (no macro expansion)", file=sys.stderr)
             try:
                 text = _read_and_inline_local_headers(self.c_path)
+                if text:
+                    print(f"gtk2laz: [{_src_basename}] raw-source OK "
+                          f"— {len(text)} bytes "
+                          f"(local #includes inlined)", file=sys.stderr)
+                else:
+                    print(f"gtk2laz: [{_src_basename}] raw-source "
+                          f"returned empty", file=sys.stderr)
                 if not self.parse_error:
                     self.parse_error = (
                         "used raw source (pcpp and gcc both unavailable)"
                     )
             except Exception as e:
+                print(f"gtk2laz: [{_src_basename}] raw-source read "
+                      f"failed: {type(e).__name__}: {e}", file=sys.stderr)
                 self.parse_error = f"failed to read source: {e}"
                 return False
         # ---- Always prepend ALL fake system headers so pycparser sees
@@ -761,15 +907,22 @@ class AstToPascal:
             fake_blob = _read_all_fake_headers(self.fake_include_dir)
             if fake_blob:
                 text = fake_blob + "\n" + text
+                print(f"gtk2laz: [{_src_basename}] injected "
+                      f"{len(fake_blob)} bytes of fake system headers",
+                      file=sys.stderr)
         # Always run the placeholder-typedef injection so any Gtk*/Gdk*
         # names not covered by the fake headers still resolve to stubs.
         if text and _inject_missing_gtk_typedefs:
             text = _inject_missing_gtk_typedefs(text)
         # ---- Parse the preprocessed text with pycparser ----
+        print(f"gtk2laz: [{_src_basename}] parsing with pycparser "
+              f"({len(text) if text else 0} bytes)...", file=sys.stderr)
         try:
             from pycparser import CParser
             parser = CParser()
             ast = parser.parse(text, filename=self.c_path)
+            print(f"gtk2laz: [{_src_basename}] pycparser OK",
+                  file=sys.stderr)
         except Exception as e:
             # pycparser raises ParseError when it hits an undefined type
             # name (e.g. ``fd_set``, ``struct timespec``, ...) or a
@@ -781,12 +934,17 @@ class AstToPascal:
             # up to 10 times so a chain of missing types
             # (``fd_set`` -> ``timeval`` -> ``port`` -> ...) can be
             # resolved in one go.
+            print(f"gtk2laz: [{_src_basename}] pycparser initial "
+                  f"parse failed: {str(e)[:300]}", file=sys.stderr)
             ast = None
             err_msg = str(e)
             self.parse_error = err_msg
-            for _ in range(10):
+            for _retry in range(10):
                 missing = _extract_missing_type_from_error(err_msg)
                 if not missing:
+                    print(f"gtk2laz: [{_src_basename}] retry "
+                          f"{_retry}: no missing type extracted, "
+                          f"giving up", file=sys.stderr)
                     break
                 # "Missing type in declaration" — the missing name is a
                 # sentinel like ``__MISSING_TYPE_LINE_<N>__``.  We look
@@ -809,17 +967,36 @@ class AstToPascal:
                             if m_id:
                                 var_name = m_id.group(1)
                                 text = f"typedef int {var_name};\n" + text
+                                print(f"gtk2laz: [{_src_basename}] retry "
+                                      f"{_retry}: injecting "
+                                      f"typedef int {var_name}; "
+                                      f"(from line {line_num})",
+                                      file=sys.stderr)
                                 # Re-parse and continue the retry loop.
                                 try:
                                     parser2 = CParser()
                                     ast = parser2.parse(text,
                                                         filename=self.c_path)
                                     self.parse_error = ""
+                                    print(f"gtk2laz: [{_src_basename}] "
+                                          f"retry {_retry}: pycparser OK",
+                                          file=sys.stderr)
                                     break
                                 except Exception as e2:
                                     err_msg = str(e2)
                                     self.parse_error = err_msg
+                                    print(f"gtk2laz: [{_src_basename}] "
+                                          f"retry {_retry}: still "
+                                          f"failing: "
+                                          f"{err_msg[:200]}",
+                                          file=sys.stderr)
                                     continue
+                            else:
+                                print(f"gtk2laz: [{_src_basename}] "
+                                      f"retry {_retry}: no identifier "
+                                      f"found on line {line_num} "
+                                      f"({err_line[:80]!r})",
+                                      file=sys.stderr)
                     except (ValueError, IndexError):
                         pass
                     # If we couldn't extract a variable name, stop
@@ -830,18 +1007,32 @@ class AstToPascal:
                 # pycparser can resolve it on the next attempt.
                 if "Missing type" in err_msg:
                     text = f"typedef int {missing};\n" + text
+                    print(f"gtk2laz: [{_src_basename}] retry {_retry}: "
+                          f"injecting typedef int {missing};",
+                          file=sys.stderr)
                 else:
                     text = f"typedef struct _{missing} {missing};\n" + text
+                    print(f"gtk2laz: [{_src_basename}] retry {_retry}: "
+                          f"injecting typedef struct _{missing} {missing};",
+                          file=sys.stderr)
                 try:
                     parser2 = CParser()
                     ast = parser2.parse(text, filename=self.c_path)
                     self.parse_error = ""
+                    print(f"gtk2laz: [{_src_basename}] retry {_retry}: "
+                          f"pycparser OK", file=sys.stderr)
                     break
                 except Exception as e2:
                     err_msg = str(e2)
                     self.parse_error = err_msg
+                    print(f"gtk2laz: [{_src_basename}] retry {_retry}: "
+                          f"still failing: {err_msg[:200]}",
+                          file=sys.stderr)
                     continue
             if ast is None:
+                print(f"gtk2laz: [{_src_basename}] pycparser parse "
+                      f"FAILED after all retries — returning False",
+                      file=sys.stderr)
                 return False
         # Filter: only keep top-level nodes whose coord.file matches our
         # source file (skip nodes coming from fake headers).
@@ -995,17 +1186,25 @@ class AstToPascal:
 def parse_with_ast(c_path: str, unit_name: str,
                    fake_include_dir: str = "/tmp/fake_libc_include",
                    form_unit: Optional[str] = None,
-                   included_units: list[str] = None) -> Optional[AstToPascal]:
+                   included_units: list[str] = None,
+                   target_platform: str = "auto") -> Optional[AstToPascal]:
     """Parse ``c_path`` with pycparser and return an AstToPascal object.
 
     Returns None if pycparser is unavailable or the file cannot be parsed
     (the caller should fall back to the pattern-based translator in that
     case).
+
+    ``target_platform`` selects which platform's preset macros
+    (``_WIN32``, ``__linux__``, ``__APPLE__`` etc.) are defined in
+    pcpp before preprocessing. This controls which ``#ifdef`` branch
+    is taken in platform-guarded headers. ``"auto"`` uses the running
+    interpreter's platform.
     """
     if not _HAS_PYCPARSER:
         return None
     a2p = AstToPascal(c_path, unit_name, fake_include_dir,
-                      form_unit, included_units)
+                      form_unit, included_units,
+                      target_platform=target_platform)
     if not a2p.parse():
         return None
     return a2p
@@ -1046,6 +1245,19 @@ class AstBodyTranslator:
         self.todo_count = 0
         self.translated_count = 0
         self._pas_line = 1
+        # Pre-statements collected during the translation of the current
+        # top-level statement. When a C assignment is used as a sub-
+        # expression (e.g. ``decodeRange /= total`` inside
+        # ``code = (decodeCode - decodeLow) / (decodeRange /= total)``),
+        # Pascal cannot keep the assignment inline because ``:=`` is
+        # not an expression in Pascal. We split such assignments into
+        # separate ``:=`` statements that are emitted *before* the
+        # surrounding expression statement, and the assignment's lvalue
+        # is used in place of the original sub-expression.
+        # ``_emit_pre`` adds a line to this buffer; ``_emit`` flushes
+        # the buffer (with the current pad) before appending its own
+        # line, so the pre-statements appear in the right place.
+        self._pre_lines: list[str] = []
 
     # ------------------------------------------------------------------
     def translate(self) -> list[str]:
@@ -1059,13 +1271,40 @@ class AstBodyTranslator:
                 self.func.body_node.block_items:
             for stmt in self.func.body_node.block_items:
                 self._translate_stmt(stmt)
+        # Flush any trailing pre-statements that were collected during
+        # the last top-level statement but never emitted (e.g. when the
+        # final statement is an expression-statement that produced
+        # pre-statements but had no trailing ``_emit`` call of its own).
+        self._flush_pre()
         return self.lines
 
     # ------------------------------------------------------------------
     def _pad(self, extra: int = 0) -> str:
         return " " * (self.indent + extra * 2)
 
+    def _emit_pre(self, text: str) -> None:
+        """Record a side-effect statement (e.g. ``decodeRange := ...``)
+        that must run *before* the surrounding expression statement.
+        Flush happens automatically the next time ``_emit`` is called."""
+        self._pre_lines.append(text)
+
+    def _flush_pre(self) -> None:
+        """Emit any pending pre-statements at the current indent.
+        Called by ``_emit`` and ``_emit_todo`` before they append."""
+        if not self._pre_lines:
+            return
+        pad = self._pad()
+        for line in self._pre_lines:
+            # Pre-statements are stored as ``text;`` (with trailing
+            # semicolon). Indent them at the current level so they
+            # appear alongside the statement that consumes them.
+            self.lines.append(f"{pad}{line}")
+            self._pas_line += 1
+            self.translated_count += 1
+        self._pre_lines = []
+
     def _emit(self, text: str) -> None:
+        self._flush_pre()
         self.lines.append(text)
         self._pas_line += 1
         self.translated_count += 1
@@ -1073,6 +1312,7 @@ class AstBodyTranslator:
     def _emit_todo(self, node, reason: str = "") -> None:
         """Emit a multi-line TODO comment for an AST node we can't
         translate. Uses the node's coord for accurate source line."""
+        self._flush_pre()
         self.todo_count += 1
         pad = self._pad()
         body_pad = pad + "  "
@@ -1757,6 +1997,11 @@ class AstBodyTranslator:
 
         For chained assignments like ``count = sum = 0``, flattens to
         ``sum := 0; count := 0;`` using _flatten_assignment.
+
+        Special handling for ``*ptr++ = value`` (C idiom: write to
+        current position, then advance pointer):
+            ptr^ := value;
+            Inc(ptr);
         """
         pad = self._pad()
         op = node.op
@@ -1766,6 +2011,29 @@ class AstBodyTranslator:
             if flat:
                 self._emit(f"{pad}{flat}")
                 return
+
+        # ---- Special case: *ptr++ = value  (and *ptr-- = value)
+        # C: ``*(ptr++) = value`` writes value to *ptr, then advances
+        # ptr. In Pascal this must be split into two statements:
+        #   ptr^ := value;
+        #   Inc(ptr);
+        # If we naively translate the lvalue with _translate_expr,
+        # we get ``Inc(ptr)^ := value`` which is invalid Pascal
+        # (``Inc`` doesn't return a value).
+        if op == "=" and isinstance(node.lvalue, c_ast.UnaryOp) \
+                and node.lvalue.op == "*":
+            inner = node.lvalue.expr
+            if isinstance(inner, c_ast.UnaryOp) \
+                    and inner.op in ("p++", "p--", "++", "--"):
+                ptr = self._translate_expr(inner.expr)
+                rhs = self._translate_expr(node.rvalue)
+                self._emit(f"{pad}{ptr}^ := {rhs};")
+                if "++" in inner.op:
+                    self._emit(f"{pad}Inc({ptr});")
+                else:
+                    self._emit(f"{pad}Dec({ptr});")
+                return
+
         lhs = self._translate_expr(node.lvalue)
         rhs = self._translate_expr(node.rvalue)
         if op == "=":
@@ -1828,12 +2096,17 @@ class AstBodyTranslator:
             self._labels = []
         if label_name not in self._labels:
             self._labels.append(label_name)
-        # If the label has a body (stmt), translate it after the label
-        if node.stmts:
+        # If the label has a body (stmt), translate it after the label.
+        # pycparser's Label node uses ``.stmt`` (singular) — it is either
+        # a single statement node or None. Older code mistakenly used the
+        # plural ``.stmts``, which raises AttributeError and aborts the
+        # entire function body translation (causing the caller to fall
+        # back to the pattern-based translator, which then loses all
+        # local variable declarations for unknown typedefs).
+        if node.stmt is not None:
             self._emit(f"{pad}{label_name}:")
             self.indent += 1
-            for stmt in node.stmts:
-                self._translate_stmt(stmt)
+            self._translate_stmt(node.stmt)
             self.indent -= 1
         else:
             self._emit(f"{pad}{label_name}:")
@@ -1956,7 +2229,12 @@ class AstBodyTranslator:
         return " + NL + ".join(pas_parts)
 
     def _expr_ID(self, node) -> str:
-        return pascalify_name(node.name)
+        name = node.name
+        # C's NULL macro → Pascal's nil. pycparser treats NULL as an
+        # identifier (not a constant), so we intercept it here.
+        if name == "NULL":
+            return "nil"
+        return pascalify_name(name)
 
     def _expr_BinaryOp(self, node) -> str:
         left = self._translate_expr(node.left)
@@ -1973,12 +2251,99 @@ class AstBodyTranslator:
             "<": "<", ">": ">", "<=": "<=", ">=": ">=",
         }
         pas_op = op_map.get(op, op)
+
+        # ---- Parenthesisation based on PASCAL operator precedence.
+        #
+        # C and Pascal have DIFFERENT operator precedence tables:
+        #
+        #   C:  * / %  >  + -  >  << >>  >  < > <= >=  >  == !=
+        #       >  &  >  ^  >  |  >  &&  >  ||
+        #
+        #   Pascal:  * / div mod and shl shr  (ALL same level)
+        #            >  + - or xor  (ALL same level)
+        #            >  = <> < > <= >=  (ALL same level)
+        #
+        # This means C expressions like ``a + b << c`` (C: ``a + (b << c)``)
+        # would parse WRONG in Pascal as ``(a + b) shl c`` because
+        # ``+`` and ``shl`` are at the SAME precedence level in Pascal.
+        #
+        # Solution: use PASCAL precedence (not C precedence) to decide
+        # whether child sub-expressions need parentheses. A child
+        # needs parens when its Pascal-precedence is LOWER than the
+        # parent's Pascal-precedence. When they are at the SAME level
+        # but are DIFFERENT operators, we also parenthesise to preserve
+        # the C parse order (because Pascal evaluates same-level
+        # operators left-to-right, but C's parse tree may have grouped
+        # them differently due to C's finer-grained precedence).
+        #
+        # Pascal precedence levels (higher = binds tighter):
+        #   3:  * / div mod and shl shr
+        #   2:  + - or xor
+        #   1:  = <> < > <= >=
+        PASCAL_PREC = {
+            # Level 3
+            "*": 3, "/": 3, "div": 3, "mod": 3, "and": 3,
+            "shl": 3, "shr": 3,
+            # Level 2
+            "+": 2, "-": 2, "or": 2, "xor": 2,
+            # Level 1
+            "=": 1, "<>": 1, "<": 1, ">": 1, "<=": 1, ">=": 1,
+        }
+
+        def _needs_parens(child_node, parent_pas_op):
+            """Return True if the child expression needs parentheses
+            when used as an operand of ``parent_pas_op``.
+
+            We use PASCAL precedence (not C precedence) because the
+            output is Pascal code that must parse correctly under
+            Pascal's precedence rules.
+
+            Two cases need parens:
+            1. Child's Pascal precedence < parent's → always parenthesise
+               (e.g. ``a + b`` inside ``c * ...`` → ``(a + b) * c``).
+            2. Child's Pascal precedence == parent's BUT different
+               operator → parenthesise to preserve C's grouping.
+               Pascal evaluates same-level ops left-to-right, but the
+               C AST may have grouped them differently.
+
+            3. EXTRA RULE for shl/shr: even though Pascal's precedence
+               makes ``1 shl 16 or 3 shl 8`` parse correctly (shl is
+               level 3, or is level 2), the user wants explicit
+               parentheses around shift results for readability:
+               ``(1 shl 16) or (3 shl 8) or 0``. So we always
+               parenthesise a shl/shr child when the parent is NOT
+               also shl/shr.
+            """
+            if not isinstance(child_node, c_ast.BinaryOp):
+                return False
+            child_pas_op = op_map.get(child_node.op, child_node.op)
+            child_prec = PASCAL_PREC.get(child_pas_op, 0)
+            parent_prec = PASCAL_PREC.get(parent_pas_op, 0)
+            # Rule 1: lower precedence needs parens
+            if child_prec < parent_prec:
+                return True
+            # Rule 2: same precedence, different operator needs parens
+            if child_prec == parent_prec and child_pas_op != parent_pas_op:
+                return True
+            # Rule 3: shl/shr results always parenthesised for
+            # readability when parent is not also shl/shr.
+            if child_pas_op in ("shl", "shr") \
+                    and parent_pas_op not in ("shl", "shr"):
+                return True
+            return False
+
+        left_node = node.left
+        right_node = node.right
         # Integer division needs special handling: C '/' for ints is div,
         # but for floats it's '/'. We default to div since most C code
         # here uses integer division.
         if op == "/":
-            return f"({left}) div ({right})"
-        return f"({left}) {pas_op} ({right})"
+            l = f"({left})" if _needs_parens(left_node, "div") else left
+            r = f"({right})" if _needs_parens(right_node, "div") else right
+            return f"{l} div {r}"
+        l = f"({left})" if _needs_parens(left_node, pas_op) else left
+        r = f"({right})" if _needs_parens(right_node, pas_op) else right
+        return f"{l} {pas_op} {r}"
 
     def _expr_UnaryOp(self, node) -> str:
         operand = self._translate_expr(node.expr)
@@ -1988,10 +2353,27 @@ class AstBodyTranslator:
         if op == "~":
             return f"not ({operand})"
         if op == "-":
+            # Negation: only parenthesise when the operand is a
+            # complex expression (BinaryOp, etc.). For simple
+            # operands (constants, identifiers, function calls),
+            # no parens are needed:
+            #   -(1)  → -1
+            #   -(a)  → -a
+            #   -(a + b) → -(a + b)
+            if isinstance(node.expr, (c_ast.Constant, c_ast.ID,
+                                      c_ast.FuncCall)):
+                return f"-{operand}"
             return f"-({operand})"
         if op == "+":
+            if isinstance(node.expr, (c_ast.Constant, c_ast.ID,
+                                      c_ast.FuncCall)):
+                return f"+{operand}"
             return f"+({operand})"
         if op == "&":
+            # Address-of: only parenthesise complex expressions.
+            if isinstance(node.expr, (c_ast.Constant, c_ast.ID,
+                                      c_ast.FuncCall)):
+                return f"@{operand}"
             return f"@({operand})"
         if op == "*":
             return f"{operand}^"
@@ -2006,11 +2388,42 @@ class AstBodyTranslator:
         return f"({op} {operand})"
 
     def _expr_Assignment(self, node) -> str:
-        # Assignment used as expression - emit as ':=' (Pascal allows
-        # this in some contexts but not all; flag with comment).
+        # Assignment used as expression (C allows this; Pascal does not).
+        # We emit a Pascal ``:=`` assignment as a *side effect* before
+        # the surrounding expression, then return the lvalue as the
+        # "value" of the expression. This works because the parent
+        # emitter collects statements via ``self._emit_pre`` and inserts
+        # them just before the current statement.
+        #
+        # Compound operators (``/=``, ``+=`` etc.) are rewritten to the
+        # equivalent ``lhs := lhs <op> rhs`` form so that pycparser's
+        # ``Assignment`` node with ``op="/="`` is handled correctly
+        # instead of being silently dropped (which previously produced
+        # ``decodeRange := total`` for ``decodeRange /= total``,
+        # discarding the divide).
         lhs = self._translate_expr(node.lvalue)
         rhs = self._translate_expr(node.rvalue)
-        return f"({lhs} := {rhs})"
+        op = node.op
+        # Compound-assignment operator → equivalent Pascal binary op.
+        # ``/=`` → ``div``, ``%=`` → ``mod``, ``<<=`` → ``shl``, etc.
+        compound_to_pas = {
+            "+=": "+", "-=": "-",
+            "*=": "*", "/=": "div", "%=": "mod",
+            "<<=": "shl", ">>=": "shr",
+            "&=": "and", "|=": "or", "^=": "xor",
+        }
+        if op == "=":
+            # Plain assignment: emit ``lhs := rhs;`` as a pre-statement
+            # and return ``lhs`` as the expression's value.
+            self._emit_pre(f"{lhs} := {rhs};")
+            return lhs
+        if op in compound_to_pas:
+            pas_op = compound_to_pas[op]
+            self._emit_pre(f"{lhs} := {lhs} {pas_op} {rhs};")
+            return lhs
+        # Unknown operator — fall back to the old behaviour with a
+        # marker so the user can review.
+        return f"({lhs} := {rhs})  /* TODO: unsupported assign-as-expr op {op} */"
 
     def _expr_FuncCall(self, node) -> str:
         # node.name is the function reference, node.args is ExprList
@@ -2130,9 +2543,47 @@ def translate_body_with_ast(ast_func, source_file: str = "",
     """
     t = AstBodyTranslator(ast_func, source_file, indent)
     lines = t.translate()
+    # Deduplicate local variable declarations.
+    #
+    # C allows the same variable name to be declared in multiple nested
+    # scopes (e.g. inside different branches of an if/else chain, or
+    # inside different invocations of the same macro that each declare
+    # ``ENetSymbol * node = ...;``). The AST flattens all these Decl
+    # nodes into a single ``self.locals`` list, producing duplicate
+    # entries like:
+    #     node: ^TENetSymbol;
+    #     node: ^TENetSymbol;
+    # Pascal forbids duplicate names in a single ``var`` block, so we
+    # dedupe by variable name, keeping the first occurrence. If a later
+    # scope uses the same name with a different type, the user must
+    # rename by hand (we keep the first type seen — that is the most
+    # common case in macro-heavy C like enet's compress.c).
+    seen_names: dict[str, str] = {}
+    deduped: list[str] = []
+    for decl in t.locals:
+        m = re.match(r"^\s*(\w+)\s*:", decl)
+        if m:
+            name = m.group(1)
+            if name in seen_names:
+                # Skip duplicate. If the type differs from the first
+                # occurrence, annotate the first decl with a comment so
+                # the user knows there is a type mismatch to review.
+                if seen_names[name] != decl.strip():
+                    # Find and annotate the first decl if not yet annotated.
+                    for i, d in enumerate(deduped):
+                        if re.match(rf"^\s*{re.escape(name)}\s*:", d) \
+                                and "// also declared as" not in d:
+                            deduped[i] = (
+                                d.rstrip().rstrip(";")
+                                + f"  // also declared as: {decl.strip()};"
+                            )
+                            break
+                continue
+            seen_names[name] = decl.strip()
+        deduped.append(decl)
     return {
         "lines": lines,
-        "locals": t.locals,
+        "locals": deduped,
         "labels": getattr(t, '_labels', []),
         "todos": t.todos,
         "stats": {

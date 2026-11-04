@@ -479,6 +479,172 @@ typedef long long gint64;
 typedef unsigned long long guint64;
 #endif
 """,
+    # ---- Minimal Windows / Winsock / MMSYSTEM stubs ----
+    # These are needed so that platform-specific .c files wrapped in
+    # ``#ifdef _WIN32`` (such as enet's win32.c) can be preprocessed
+    # and AST-parsed on a Linux host. Without these stubs, pycparser
+    # sees ``SOCKET``, ``WSADATA``, ``HANDLE`` etc. used as type names
+    # with no typedef in scope and aborts with ``Missing type in
+    # declaration``, which causes the whole .c file's AST parse to
+    # fail and the converter falls back to the pattern-based
+    # extractor (which then loses every local variable declaration
+    # that uses a Windows-only typedef).
+    "windows.h": """#ifndef _WINDOWS_H
+#define _WINDOWS_H
+typedef unsigned long  DWORD;
+typedef unsigned short WORD;
+typedef unsigned char  BYTE;
+typedef int            BOOL;
+typedef void *         HANDLE;
+typedef void *         PVOID;
+typedef void *         LPVOID;
+typedef char *         LPSTR;
+typedef const char *   LPCSTR;
+typedef int            INT;
+typedef unsigned int   UINT;
+typedef long           LONG;
+typedef unsigned long  ULONG;
+typedef short          SHORT;
+typedef unsigned short USHORT;
+typedef wchar_t        WCHAR;
+typedef wchar_t *      LPWSTR;
+typedef const wchar_t *LPCWSTR;
+typedef unsigned long  u_long;
+typedef unsigned short u_short;
+typedef unsigned int   u_int;
+typedef unsigned char  u_char;
+#define WINAPI
+#define STDCALL
+#define CALLBACK
+#define __stdcall
+#define __cdecl
+#define LOBYTE(w)  ((BYTE)(w))
+#define HIBYTE(w)  ((BYTE)(((WORD)(w) >> 8) & 0xFF))
+#define LOWORD(w)  ((WORD)(w))
+#define HIWORD(w)  ((WORD)(((DWORD)(w) >> 16) & 0xFFFF))
+#endif
+""",
+    "winsock2.h": """#ifndef _WINSOCK2_H
+#define _WINSOCK2_H
+#include <windows.h>
+typedef int SOCKET;
+#define INVALID_SOCKET  (SOCKET)(~0)
+#define SOCKET_ERROR    (-1)
+#define SD_RECEIVE      0
+#define SD_SEND         1
+#define SD_BOTH         2
+#define PF_INET         2
+#define AF_INET         2
+#define SOCK_STREAM     1
+#define SOCK_DGRAM      2
+#define SOL_SOCKET      0xffff
+#define SO_DEBUG        0x0001
+#define SO_REUSEADDR    0x0004
+#define SO_KEEPALIVE    0x0008
+#define SO_DONTROUTE    0x0010
+#define SO_BROADCAST    0x0020
+#define SO_LINGER       0x0080
+#define SO_OOBINLINE    0x0100
+#define SO_SNDBUF       0x1001
+#define SO_RCVBUF       0x1002
+#define SO_SNDTIMEO     0x1005
+#define SO_RCVTIMEO     0x1006
+#define SO_ERROR        0x1007
+#define IPPROTO_IP      0
+#define IPPROTO_TCP     6
+#define IPPROTO_UDP     17
+#define IP_TTL          7
+#define TCP_NODELAY     1
+#define MSG_OOB         0x1
+#define MSG_PEEK        0x2
+#define MSG_DONTROUTE   0x4
+#define MSG_PARTIAL     0x8000
+#define SOMAXCONN       0x7fffffff
+#define INADDR_ANY      0x00000000
+#define INADDR_LOOPBACK 0x7f000001
+#define INADDR_BROADCAST 0xffffffff
+#define INADDR_NONE     0xffffffff
+#define FIONBIO         0x8004667e
+struct sockaddr {
+    unsigned short sa_family;
+    char sa_data[14];
+};
+struct in_addr {
+    unsigned long s_addr;
+};
+struct sockaddr_in {
+    short sin_family;
+    unsigned short sin_port;
+    struct in_addr sin_addr;
+    char sin_zero[8];
+};
+struct hostent {
+    char *h_name;
+    char **h_aliases;
+    short h_addrtype;
+    short h_length;
+    char **h_addr_list;
+};
+struct timeval {
+    long tv_sec;
+    long tv_usec;
+};
+typedef struct { unsigned int fd_count; int fd_array[64]; } fd_set;
+#define FD_ZERO(set) do { ((fd_set *)(set))->fd_count = 0; } while (0)
+#define FD_SET(s, set) do {} while (0)
+#define FD_CLR(s, set) do {} while (0)
+#define FD_ISSET(s, set) 0
+typedef struct _WSABUF { unsigned long len; char *buf; } WSABUF, *LPWSABUF;
+typedef struct _WSADATA {
+    WORD wVersion;
+    WORD wHighVersion;
+    char szDescription[257];
+    char szSystemStatus[129];
+    unsigned short iMaxSockets;
+    unsigned short iMaxUdpDg;
+    char *lpVendorInfo;
+} WSADATA;
+#define MAKEWORD(a, b) ((WORD)(((BYTE)(a)) | (((WORD)((BYTE)(b))) << 8)))
+int    WSAStartup(WORD, WSADATA *);
+int    WSACleanup(void);
+int    WSAGetLastError(void);
+int    ioctlsocket(SOCKET, long, unsigned long *);
+int    closesocket(SOCKET);
+SOCKET socket(int, int, int);
+int    bind(SOCKET, const struct sockaddr *, int);
+int    listen(SOCKET, int);
+SOCKET accept(SOCKET, struct sockaddr *, int *);
+int    connect(SOCKET, const struct sockaddr *, int);
+int    getsockname(SOCKET, struct sockaddr *, int *);
+int    getpeername(SOCKET, struct sockaddr *, int *);
+int    setsockopt(SOCKET, int, int, const char *, int);
+int    getsockopt(SOCKET, int, int, char *, int *);
+int    send(SOCKET, const char *, int, int);
+int    recv(SOCKET, char *, int, int);
+int    sendto(SOCKET, const char *, int, int, const struct sockaddr *, int);
+int    recvfrom(SOCKET, char *, int, int, struct sockaddr *, int *);
+int    shutdown(SOCKET, int);
+struct hostent *gethostbyname(const char *);
+struct hostent *gethostbyaddr(const char *, int, int);
+unsigned long inet_addr(const char *);
+char *inet_ntoa(struct in_addr);
+unsigned short htons(unsigned short);
+unsigned short ntohs(unsigned short);
+unsigned long  htonl(unsigned long);
+unsigned long  ntohl(unsigned long);
+int select(int, fd_set *, fd_set *, fd_set *, const struct timeval *);
+int WSASendTo(SOCKET, LPWSABUF, DWORD, DWORD *, DWORD, const struct sockaddr *, int, void *, void *);
+int WSARecvFrom(SOCKET, LPWSABUF, DWORD, DWORD *, DWORD *, struct sockaddr *, int *, void *, void *);
+#endif
+""",
+    "mmsystem.h": """#ifndef _MMSYSTEM_H
+#define _MMSYSTEM_H
+#include <windows.h>
+int timeBeginPeriod(unsigned int);
+int timeEndPeriod(unsigned int);
+unsigned int timeGetTime(void);
+#endif
+""",
 }
 
 

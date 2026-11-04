@@ -77,9 +77,19 @@ class Gtk2LazApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("gtk2laz — GTK to Lazarus converter")
-        root.geometry("1200x780")
-        root.minsize(900, 600)
+        # Show the version + build timestamp in the window title bar
+        # so the user can tell at a glance which build they are
+        # running. The ``get_version_string()`` function lives in
+        # gtk2laz.py and reads ``_build_timestamp.txt`` (written by
+        # the build scripts) or falls back to gtk2laz.py's mtime.
+        try:
+            from gtk2laz import get_version_string
+            _version_str = get_version_string()
+        except Exception:
+            _version_str = "gtk2laz (version unknown)"
+        root.title(f"gtk2laz — GTK to Lazarus converter  [{_version_str}]")
+        root.geometry("1200x900")
+        root.minsize(900, 700)
 
         # State
         self.input_dir = tk.StringVar()
@@ -87,6 +97,17 @@ class Gtk2LazApp:
         self.mode = tk.StringVar(value="full")  # full | c_only | reload
         self.form_unit = tk.StringVar(value="mainform")
         self.form_class = tk.StringVar(value="TMainForm")
+        # Target platform for #ifdef branch selection. ``"auto"``
+        # mirrors the running interpreter's platform. The user can
+        # override via the dropdown to convert Windows-only source
+        # code on a Linux host (or vice versa).
+        self.target_platform = tk.StringVar(value="auto")
+        # Extra ``--define`` macros the user wants to predefine. We
+        # store these as a single comma-separated string in the entry
+        # field and split on commas before passing them to
+        # ``convert()``. The user types e.g.
+        # ``HAVE_EPOLL=1,DEBUG=1`` to define both macros.
+        self.extra_defines_str = tk.StringVar(value="")
         self.status_text = tk.StringVar(value="Ready.")
         self.progress = tk.IntVar(value=0)
         self.current_file = tk.StringVar(value="")  # currently-processed file
@@ -97,6 +118,11 @@ class Gtk2LazApp:
 
         # All todos currently shown in the tree
         self.todos: list[dict] = []
+
+        # Log lines collected from stderr (see _run_conversion_thread).
+        # We append to this list as the worker thread prints to its
+        # captured stderr; the UI polls the result queue for new lines.
+        self._log_lines: list[str] = []
 
         self._build_ui()
         self._poll_result_queue()
@@ -143,8 +169,29 @@ class Gtk2LazApp:
         ttk.Entry(opt_row, textvariable=self.form_class, width=14).pack(
             side=tk.LEFT, padx=2)
 
+        # Platform + defines row — lets the user select which platform's
+        # preset macros (_WIN32 / __linux__ / __APPLE__) are defined
+        # during preprocessing, and add extra --define macros on top.
+        plat_row = ttk.Frame(grid)
+        plat_row.grid(row=4, column=1, sticky=tk.W, padx=4, pady=2)
+        ttk.Label(plat_row, text="Platform:").pack(side=tk.LEFT)
+        # ttk.Combobox gives a dropdown the user can also type into,
+        # but we restrict the choices to the four valid values.
+        ttk.Combobox(plat_row, textvariable=self.target_platform,
+                     values=["auto", "windows", "linux", "macos"],
+                     state="readonly", width=10).pack(
+            side=tk.LEFT, padx=(2, 12))
+        ttk.Label(plat_row, text="Defines:").pack(side=tk.LEFT)
+        ttk.Entry(plat_row, textvariable=self.extra_defines_str,
+                  width=30).pack(side=tk.LEFT, padx=2)
+        # Tooltip-like hint (we can't easily do real tooltips in plain
+        # Tkinter, so we use a small grey label).
+        ttk.Label(plat_row,
+                  text="(comma-separated, e.g. HAVE_EPOLL=1,DEBUG)",
+                  foreground="#888888").pack(side=tk.LEFT, padx=4)
+
         run_row = ttk.Frame(grid)
-        run_row.grid(row=4, column=1, sticky=tk.W, padx=4, pady=6)
+        run_row.grid(row=5, column=1, sticky=tk.W, padx=4, pady=6)
         self.run_btn = ttk.Button(run_row, text="Run conversion",
                                    command=self._start_conversion)
         self.run_btn.pack(side=tk.LEFT)
@@ -163,6 +210,15 @@ class Gtk2LazApp:
         tree_wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         columns = ("location", "function", "reason", "snippet")
+        # Use grid layout so the vertical scrollbar ALWAYS spans the
+        # full height of the tree (with ``rowconfigure(weight=1)`` on
+        # the tree's row) and the horizontal scrollbar ALWAYS spans the
+        # full width below it. The previous ``pack`` layout had a
+        # subtle bug where, when the tree shrank vertically (e.g.
+        # because the window was resized), the vertical scrollbar
+        # stayed at the old height and ended up either too short or
+        # hanging outside the tree — making it look like there was no
+        # vertical scrollbar at all.
         self.tree = ttk.Treeview(tree_wrap, columns=columns,
                                   show="headings", selectmode="browse")
         self.tree.heading("location", text="File:Line")
@@ -174,15 +230,27 @@ class Gtk2LazApp:
         self.tree.column("reason", width=200, anchor=tk.W)
         self.tree.column("snippet", width=400, anchor=tk.W)
 
+        # Vertical scrollbar — placed in column 1, spanning row 0 only
+        # (same row as the tree). Always visible because the grid row
+        # has weight=1, so it stretches with the tree.
         vsb = ttk.Scrollbar(tree_wrap, orient=tk.VERTICAL,
                              command=self.tree.yview)
+        # Horizontal scrollbar — placed in row 1 (below the tree),
+        # spanning column 0 only (so it doesn't overlap the vsb).
         hsb = ttk.Scrollbar(tree_wrap, orient=tk.HORIZONTAL,
                              command=self.tree.xview)
         self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        # horizontal scrollbar below tree (separate frame)
-        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+
+        # Grid: tree in (0,0), vsb in (0,1), hsb in (1,0)
+        self.tree.grid(row=0, column=0, sticky=tk.NSEW)
+        vsb.grid(row=0, column=1, sticky=tk.NS)
+        hsb.grid(row=1, column=0, sticky=tk.EW)
+        tree_wrap.rowconfigure(0, weight=1)
+        tree_wrap.columnconfigure(0, weight=1)
+        # Row 1 (horizontal scrollbar) should NOT grow vertically.
+        tree_wrap.rowconfigure(1, weight=0)
+        # Column 1 (vertical scrollbar) should NOT grow horizontally.
+        tree_wrap.columnconfigure(1, weight=0)
 
         self.tree.bind("<<TreeviewSelect>>", self._on_todo_selected)
         self.tree.bind("<Double-1>", self._on_todo_double_click)
@@ -240,6 +308,50 @@ class Gtk2LazApp:
                                      background="#f0f0f0")
 
         middle.add(viewer_frame, weight=3)
+
+        # ---- Diagnostics log (bottom, collapsible-ish) ----
+        # Captures stderr output from pcpp / pycparser / AST translator
+        # so the user can see WHY conversion produced many TODOs (e.g.
+        # "pcpp preprocessing failed for compress.c: PermissionError: ..."
+        # on Windows when ply cannot write its parser tables inside the
+        # read-only PyInstaller _MEIPASS bundle).
+        log_frame = ttk.LabelFrame(self.root, text="Diagnostics log")
+        log_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=False,
+                       padx=8, pady=(4, 2))
+        log_wrap = ttk.Frame(log_frame)
+        log_wrap.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self.log_text = tk.Text(log_wrap, wrap=tk.NONE, height=8,
+                                font=("TkFixedFont", 9),
+                                state=tk.DISABLED,
+                                background="#1e1e1e", foreground="#d4d4d4",
+                                insertbackground="#d4d4d4")
+        log_y = ttk.Scrollbar(log_wrap, orient=tk.VERTICAL,
+                              command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_y.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_y.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Tag colors for the dark log panel
+        self.log_text.tag_configure("error",
+                                    foreground="#ff6b6b",
+                                    background="#1e1e1e")
+        self.log_text.tag_configure("warn",
+                                    foreground="#ffd866",
+                                    background="#1e1e1e")
+        self.log_text.tag_configure("info",
+                                    foreground="#78dce8",
+                                    background="#1e1e1e")
+        self.log_text.tag_configure("ok",
+                                    foreground="#a9dc76",
+                                    background="#1e1e1e")
+        # Progress lines: dimmer blue-grey so they don't drown out
+        # actual errors/warnings, but still readable. This is the
+        # colour used for "[progress] Converting coff.h…" etc. —
+        # the trail of which files were processed during conversion.
+        self.log_text.tag_configure("progress",
+                                    foreground="#6a9955",
+                                    background="#1e1e1e")
 
         # ---- Bottom: status + current file + progress ----
         bottom = ttk.Frame(self.root)
@@ -301,6 +413,31 @@ class Gtk2LazApp:
                 messagebox.showerror("Output directory",
                                      "Please choose an output directory.")
                 return
+            # Warn the user if the input and output directories are the
+            # same. Writing the converted .pas files, conversion.log
+            # and CONVERSION_REPORT.md into the source tree is usually
+            # a mistake — it pollutes the C source directory with
+            # Pascal output that the user then has to clean up by
+            # hand, and makes it easy to accidentally re-convert the
+            # .pas files on a second run. We allow it (the user may
+            # have a good reason) but warn loudly.
+            try:
+                _in_abs = os.path.abspath(in_dir)
+                _out_abs = os.path.abspath(out_dir)
+                if os.path.normcase(_in_abs) == os.path.normcase(_out_abs):
+                    if not messagebox.askyesno(
+                            "Input == Output",
+                            "The input and output directories are the "
+                            "same.\n\n"
+                            "This will write .pas files, conversion.log, "
+                            "and CONVERSION_REPORT.md directly into your "
+                            "C source directory, which is usually NOT "
+                            "what you want (the converted files will "
+                            "mix with the originals).\n\n"
+                            "Do you want to continue anyway?"):
+                        return
+            except Exception:
+                pass  # don't let the comparison crash conversion
         else:
             if not out_dir or not os.path.isdir(out_dir):
                 messagebox.showerror("Output directory",
@@ -317,6 +454,23 @@ class Gtk2LazApp:
         self.tree.delete(*self.tree.get_children())
         self.todos = []
 
+        # Clear the diagnostics log panel so the user sees only the
+        # output of THIS conversion run (not the accumulated output of
+        # previous runs).
+        if hasattr(self, "log_text"):
+            self.log_text.configure(state=tk.NORMAL)
+            self.log_text.delete("1.0", tk.END)
+            self.log_text.configure(state=tk.DISABLED)
+            # Print an immediate "starting" line so the log panel is
+            # never empty while the conversion is in progress. Without
+            # this, there's a brief window where the user clicks "Run
+            # conversion" and nothing happens in the log until the
+            # first progress callback fires (which can be a second or
+            # two later for large projects).
+            self._append_log_line(
+                f"[info] Starting conversion: mode={mode} "
+                f"input={in_dir} output={out_dir}")
+
         # Make gtk2laz modules importable when frozen.
         here = os.path.dirname(os.path.abspath(__file__))
         if here not in sys.path:
@@ -331,7 +485,48 @@ class Gtk2LazApp:
 
     def _run_conversion_thread(self, mode: str,
                                 in_dir: str, out_dir: str) -> None:
-        """Worker: run the conversion in a background thread."""
+        """Worker: run the conversion in a background thread.
+
+        We redirect ``sys.stderr`` to a queue-feeding wrapper for the
+        duration of the conversion so that diagnostic messages emitted
+        by pcpp / pycparser / the AST translator (e.g.
+        ``"gtk2laz: pcpp preprocessing failed for compress.c:
+        PermissionError: ..."``) appear in the GUI's diagnostics log
+        panel instead of being silently dropped (which is what happened
+        on Windows — the user saw ~1100 TODOs with no clue why).
+        """
+        # Capture stderr from the worker thread.
+        # We use a per-thread proxy that forwards writes to the result
+        # queue as ("log", line, level) tuples; the UI thread drains the
+        # queue and appends to the diagnostics log.
+        import io
+        import re
+
+        class _QueueWriter(io.TextIOBase):
+            """Writes text lines to the result queue as log events."""
+
+            def __init__(self, q):
+                self._q = q
+                self._buf = ""
+
+            def write(self, s):
+                if not s:
+                    return 0
+                self._buf += s
+                # Split on newlines; each complete line becomes a log
+                # event. Trailing partial line stays in the buffer.
+                while "\n" in self._buf:
+                    line, self._buf = self._buf.split("\n", 1)
+                    self._q.put(("log", line.rstrip()))
+                return len(s)
+
+            def flush(self):
+                if self._buf:
+                    self._q.put(("log", self._buf.rstrip()))
+                    self._buf = ""
+
+        old_stderr = sys.stderr
+        sys.stderr = _QueueWriter(self._result_q)
         try:
             if mode == "reload":
                 from gtk2laz import scan_todos_in_project
@@ -349,33 +544,159 @@ class Gtk2LazApp:
             def _on_progress(msg: str) -> None:
                 self._result_q.put(("progress", msg))
 
+            # Read the platform selection from the Combobox and the
+            # defines from the Entry field. The defines string is
+            # comma-separated; we split on commas and strip whitespace.
+            # An empty string yields no defines.
+            _platform = self.target_platform.get() or "auto"
+            _defines_str = self.extra_defines_str.get() or ""
+            _extra_defines = [
+                d.strip() for d in _defines_str.split(",") if d.strip()
+            ]
+
+            # Emit a "start" log line so the user can see something is
+            # happening even before any progress callback fires.
+            # Include the version + build timestamp so the log file
+            # records exactly which build produced this conversion.
+            try:
+                from gtk2laz import get_version_string as _gvs
+                _vstr = _gvs()
+            except Exception:
+                _vstr = "gtk2laz (version unknown)"
+            print(f"[info] Starting conversion: version={_vstr} "
+                  f"mode={mode} "
+                  f"platform={_platform} defines={_extra_defines} "
+                  f"input={in_dir} output={out_dir}")
+
             result = convert(in_dir, out_dir,
                               form_unit=self.form_unit.get() or "mainform",
                               form_class=self.form_class.get() or "TMainForm",
                               c_only=c_only,
-                              progress_callback=_on_progress)
+                              progress_callback=_on_progress,
+                              target_platform=_platform,
+                              extra_defines=_extra_defines)
             self._result_q.put(("ok", result))
         except Exception as e:  # noqa: BLE001
+            # Print the full traceback to our captured stderr so the
+            # user can see the underlying error in the log panel.
+            # (sys.stderr is still our _QueueWriter at this point.)
+            import traceback
+            traceback.print_exc()
             self._result_q.put(("error", str(e)))
+        finally:
+            # Flush any pending stderr output and restore the original.
+            try:
+                sys.stderr.flush()
+            except Exception:
+                pass
+            sys.stderr = old_stderr
+            # Mark end-of-log so the UI can do any post-processing.
+            self._result_q.put(("log_end", None))
 
     def _poll_result_queue(self) -> None:
         try:
             while True:
                 kind, payload = self._result_q.get_nowait()
                 if kind == "progress":
-                    # Update the current-file indicator
+                    # Update the current-file indicator (status bar)
                     self.current_file.set(payload)
+                    # ALSO append the progress message to the
+                    # diagnostics log so the user has a visible trail
+                    # of which files were processed (and in what order).
+                    # Without this, the log panel only shows stderr
+                    # output, so when conversion runs cleanly the log
+                    # appears empty and the user has no feedback that
+                    # anything is happening at all.
+                    self._append_log_line(f"[progress] {payload}")
                     # Bump progress slightly so the bar looks alive
                     cur = self.progress.get()
                     if cur < 90:
                         self.progress.set(cur + 2)
+                elif kind == "log":
+                    # Append a captured stderr line to the diagnostics
+                    # log panel.
+                    self._append_log_line(payload)
+                elif kind == "log_end":
+                    # Worker thread finished emitting log output.
+                    # We could add a visual marker here; for now we just
+                    # ignore it (the panel scrolls automatically).
+                    pass
                 elif kind == "ok":
                     self._on_conversion_done(payload)
-                else:
+                elif kind == "error":
                     self._on_conversion_error(payload)
         except queue.Empty:
             pass
         self.root.after(150, self._poll_result_queue)
+
+    def _append_log_line(self, line: str) -> None:
+        """Append one captured stderr line to the diagnostics log panel,
+        tagging it by severity so it gets the right colour.
+
+        Also appends the line to ``self._log_lines`` so it can be
+        written out to ``conversion.log`` in the output directory when
+        the conversion finishes. Without this in-memory trail, the
+        log panel's text widget would be the only place the log
+        exists — and the user cannot copy from a Tk ``Text`` widget
+        that is configured as ``state=tk.DISABLED`` (the standard
+        keyboard shortcuts are intercepted).
+        """
+        if not hasattr(self, "log_text"):
+            return
+        # Keep the in-memory trail so we can write it to a file later.
+        # We keep the timestamp prefix too so the saved file has the
+        # same content the user saw in the panel.
+        self._log_lines.append(line)
+        # Classify the line by prefix so we can colour it.
+        # Recognised prefixes (emitted by pcpp_preprocessor.py and
+        # ast_translator.py):
+        #   "gtk2laz: pcpp preprocessing failed ..." -> error
+        #   "gtk2laz: pcpp produced no output ..."  -> warn
+        #   "gtk2laz: pcpp preprocess() raised ..." -> error
+        #   "[info] ..."                              -> info
+        #   "[progress] ..."                          -> progress
+        #   "[ok] ..."                                 -> ok
+        #   "[error] ..."                              -> error
+        #   "Traceback (most recent call last):"    -> error
+        #   Lines beginning with whitespace+File/line are traceback
+        #   continuation lines -> error
+        tag = "info"
+        if line.startswith("gtk2laz:"):
+            if "failed" in line or "raised" in line or "error" in line.lower():
+                tag = "error"
+            elif "no output" in line or "fall" in line.lower():
+                tag = "warn"
+            else:
+                tag = "info"
+        elif line.startswith("Traceback"):
+            tag = "error"
+        elif line.lstrip().startswith("File ") \
+                or "Error" in line or "Exception" in line:
+            tag = "error"
+        elif line.startswith("[info]"):
+            tag = "info"
+        elif line.startswith("[progress]"):
+            # Progress messages from the worker thread — these tell the
+            # user which file is being processed. We use a distinct
+            # colour (light blue) so they are visually separable from
+            # informational / error lines.
+            tag = "progress"
+        elif line.startswith("[ok]"):
+            tag = "ok"
+        elif line.startswith("[error]"):
+            tag = "error"
+        elif "warning" in line.lower():
+            tag = "warn"
+        elif "ok" in line.lower() and "fail" not in line.lower():
+            tag = "ok"
+
+        self.log_text.configure(state=tk.NORMAL)
+        try:
+            self.log_text.insert(tk.END, line + "\n", tag)
+            # Auto-scroll to bottom
+            self.log_text.see(tk.END)
+        finally:
+            self.log_text.configure(state=tk.DISABLED)
 
     def _on_conversion_done(self, result: dict) -> None:
         self.progress.set(100)
@@ -395,6 +716,18 @@ class Gtk2LazApp:
         self.status_text.set(msg)
         self.current_file.set("")  # clear file indicator on completion
         self.run_btn.configure(state=tk.NORMAL)
+        # Also log the completion line so the user can see in the log
+        # panel what the final state was (TODO count + output dir).
+        self._append_log_line(
+            f"[ok] {msg}")
+        # Save the conversion log to a file in the output directory so
+        # the user can copy/paste from it (the on-screen log panel is a
+        # disabled Tk Text widget, which blocks Ctrl+C in many
+        # environments). The log file always has the same name
+        # (``conversion.log``) so the user knows where to find it.
+        # We also save it in the temp output dir if conversion failed
+        # before writing any files (so the log is never lost).
+        self._save_conversion_log(out_dir)
         # Slowly decay progress bar
         self.root.after(2000, lambda: self.progress.set(0))
 
@@ -403,7 +736,67 @@ class Gtk2LazApp:
         self.status_text.set("Conversion failed.")
         self.current_file.set("")  # clear file indicator on error
         self.run_btn.configure(state=tk.NORMAL)
+        # Log the error too so the user has a record of it in the log
+        # panel (alongside any stderr/traceback lines that were
+        # captured during the conversion).
+        self._append_log_line(f"[error] Conversion failed: {msg}")
+        # Even on error, save the conversion log so the user can
+        # inspect what happened. The output_dir might not be set yet
+        # (conversion may have failed before any files were written),
+        # so we fall back to the input directory or a temp location.
+        out_dir = self.output_dir.get().strip()
+        if not out_dir:
+            out_dir = os.path.dirname(self.input_dir.get().strip()) or "."
+        self._save_conversion_log(out_dir)
         messagebox.showerror("Conversion failed", msg)
+
+    def _save_conversion_log(self, out_dir: str) -> None:
+        """Write the accumulated diagnostics log (``self._log_lines``)
+        to ``<out_dir>/conversion.log``. The file is overwritten on
+        each conversion so it always reflects the most recent run.
+
+        The log contains every line that appeared in the on-screen
+        diagnostics log panel, in order: progress messages ("[progress]
+        Converting coff.h…"), info lines ("[info] Starting
+        conversion…"), error messages ("gtk2laz: AST parse failed for
+        compress.c …"), and the final "[ok] Done — N TODO(s)…" line.
+
+        The user can open this file in any text editor and copy/paste
+        freely, which is not possible from the disabled Tk Text widget
+        in the GUI.
+        """
+        if not out_dir:
+            return
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            return
+        log_path = os.path.join(out_dir, "conversion.log")
+        try:
+            # Write with a small header so the file is self-documenting
+            # when the user opens it weeks later.
+            import datetime as _dt
+            header = (
+                f"gtk2laz conversion log\n"
+                f"Date: {_dt.datetime.now().isoformat(timespec='seconds')}\n"
+                f"Output directory: {out_dir}\n"
+                f"Lines: {len(self._log_lines)}\n"
+                f"{'=' * 60}\n"
+            )
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(header)
+                for line in self._log_lines:
+                    f.write(line + "\n")
+            # Tell the user where the log was saved so they can find
+            # it without having to look around.
+            self._append_log_line(
+                f"[info] Conversion log saved to: {log_path}")
+        except Exception as _e:
+            # Don't let a failure to save the log mask the actual
+            # conversion result — just note it in the log panel.
+            self._append_log_line(
+                f"[warn] Could not save conversion log to {log_path}: "
+                f"{type(_e).__name__}: {_e}")
 
     # ------------------------------------------------------------------
     # TODO tree

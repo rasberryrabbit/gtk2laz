@@ -357,7 +357,7 @@ def lookup_signal(gtk_signal: str):
 # Type mapping used by the C-to-Pascal translator.
 
 C_TYPE_MAP = {
-    "void":           "",
+    "void":           "Pointer",
     "int":            "Integer",
     "signed":         "Integer",
     "signed int":     "Integer",
@@ -466,6 +466,14 @@ def c_type_to_pascal(c_type: str) -> str:
     t = t.replace("*", "").strip()
     # const modifier
     t = t.replace("const ", "").replace("const", "").strip()
+    # Strip C ``struct`` / ``union`` / ``enum`` keyword prefix.
+    # ``struct _ENetHost`` → ``_ENetHost``, then pascalize to
+    # ``T_ENetHost``. ``struct ENetHost`` (no underscore) → ``ENetHost``
+    # → ``TENetHost``.
+    for kw in ("struct ", "union ", "enum "):
+        if t.startswith(kw):
+            t = t[len(kw):].strip()
+            break
     pas = C_TYPE_MAP.get(t)
     if pas is None:
         # Windows-style typedefs that are already Pascal-compatible.
@@ -512,7 +520,20 @@ def c_type_to_pascal(c_type: str) -> str:
         }
         if pas in _PTR_TYPE_MAP:
             return _PTR_TYPE_MAP[pas]
-        return "^" + pas
+        # void* → Pointer (not ^Pointer). ``Pointer`` is Pascal's
+        # untyped pointer, equivalent to C's ``void *``.
+        if pas == "Pointer":
+            return "Pointer"
+        # For custom record/class types, use the P-prefix convention
+        # (``PSomeRecord``) instead of ``^TSomeRecord``. The
+        # HeaderTranslator auto-generates these pointer-type aliases
+        # for every struct/enum typedef, so the user gets clean
+        # Pascal pointer types. If the type starts with ``T`` (e.g.
+        # ``TENetSymbol``), we strip the ``T`` and prepend ``P``
+        # (``PENetSymbol``); otherwise we just prepend ``P``.
+        if pas.startswith("T") and len(pas) > 1 and pas[1].isupper():
+            return "P" + pas[1:]
+        return "P" + pas
     return pas
 
 

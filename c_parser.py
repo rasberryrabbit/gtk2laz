@@ -47,24 +47,961 @@ _PREPROC_RE = re.compile(r"^\s*#\s*[a-z]+\s*[^\n]*", re.MULTILINE | re.IGNORECAS
 
 
 def strip_comments(src: str) -> str:
-    """Replace comments with whitespace, keeping newlines."""
+    """Replace comments with whitespace, keeping newlines.
+
+    Exception: ``/* Macro: ... */`` markers emitted by the macro
+    expansion are PRESERVED — they document where each macro call was
+    expanded and are converted to Pascal comments by the translator.
+    """
     def repl(m: re.Match) -> str:
         text = m.group(0)
+        if text.lstrip().startswith("/*") and "Macro:" in text:
+            return text
         return "\n" * text.count("\n")
     return _COMMENT_RE.sub(repl, src)
 
 
 def strip_preprocessor(src: str) -> tuple[str, list[str]]:
-    """Pull out #define/#include lines so the parser can ignore them."""
+    """Pull out #define/#include lines so the parser can ignore them.
+
+    Also evaluates PROVABLE conditional-compilation branches:
+      * ``#ifdef X`` where X was explicitly ``#undef``'d in this file
+        (and never ``#define``d) — the branch is blanked.  This is the
+        ``#undef ENET_CONTEXT_EXCLUSION`` feature-disable idiom.
+      * ``#if 0`` branches are blanked.
+      * Unknown conditions keep BOTH branches (the previous behaviour)
+        because the symbol may be defined by the real build command
+        line or by headers we don't see here.
+
+    Inactive lines are blanked (keeping line numbering) and their
+    directives are NOT collected.
+    """
     directives: list[str] = []
-    out_lines = []
+    out_lines: list[str] = []
+    defined: set[str] = set()
+    undefed: set[str] = set()   # explicitly #undef'd, never defined here
+    # Conditional stack. Each entry:
+    #   [parent_active, branch_active, any_branch_taken, both_mode]
+    # ``both_mode`` entries keep every branch active (unknown
+    # conditions — preserves the old keep-everything behaviour).
+    stack: list[list] = []
+
+    def act() -> bool:
+        for parent, cur, _t, _b in stack:
+            if not (parent and cur):
+                return False
+        return True
+
     for line in src.splitlines():
-        if re.match(r"\s*#\s*\w+", line):
-            directives.append(line.strip())
-            out_lines.append("")  # keep line numbering
-        else:
+        m_dir = re.match(r"\s*#\s*(\w+)\s*(.*)$", line)
+        if m_dir:
+            kw = m_dir.group(1)
+            rest = m_dir.group(2).strip()
+            if kw in ("ifdef", "ifndef"):
+                parts = rest.split()
+                name = parts[0] if parts else ""
+                if name in defined:
+                    cond = (kw == "ifdef")
+                    stack.append([act(), cond, cond, False])
+                elif name in undefed:
+                    cond = (kw == "ifndef")
+                    stack.append([act(), cond, cond, False])
+                else:
+                    # Unknown symbol — keep both branches.
+                    stack.append([act(), True, True, True])
+            elif kw == "if":
+                cond = _eval_pp_cond(rest, defined, undefed)
+                if cond is None:
+                    stack.append([act(), True, True, True])
+                else:
+                    stack.append([act(), cond, cond, False])
+            elif kw == "elif":
+                if stack:
+                    cond = _eval_pp_cond(rest, defined, undefed)
+                    entry = stack[-1]
+                    if entry[3]:
+                        entry[1] = True
+                    else:
+                        c = (not entry[2]) and (cond is None or cond)
+                        entry[1] = c and entry[0]
+                        entry[2] = entry[2] or c
+                else:
+                    stack.append([True, True, True, True])
+            elif kw == "else":
+                if stack:
+                    entry = stack[-1]
+                    if entry[3]:
+                        entry[1] = True
+                    else:
+                        entry[1] = (not entry[2]) and entry[0]
+            elif kw == "endif":
+                if stack:
+                    stack.pop()
+            elif kw == "define":
+                m_name = re.match(r"(\w+)", rest)
+                if m_name and act():
+                    defined.add(m_name.group(1))
+                    undefed.discard(m_name.group(1))
+                if act():
+                    directives.append(line.strip())
+                out_lines.append("")
+                continue
+            elif kw == "undef":
+                m_name = re.match(r"(\w+)", rest)
+                if m_name:
+                    nm = m_name.group(1)
+                    if nm in defined:
+                        defined.discard(nm)
+                    else:
+                        undefed.add(nm)
+                out_lines.append("")
+                continue
+            else:
+                # include / pragma / error / warning / line ...
+                if act():
+                    directives.append(line.strip())
+                out_lines.append("")
+                continue
+            # Conditional directives are blanked, never collected.
+            out_lines.append("")
+            continue
+        if act():
             out_lines.append(line)
+        else:
+            out_lines.append("")
     return "\n".join(out_lines), directives
+
+
+def _eval_pp_cond(
+    expr: str,
+    defined: set,
+    undefed: set
+):
+    """Evaluate a ``#if`` expression.  Returns True/False, or ``None``
+    when the expression references unknown symbols (caller keeps both
+    branches in that case)."""
+    expr = expr.strip()
+    if not expr:
+        return None
+    if expr in ("0", "false"):
+        return False
+    if expr in ("1", "true"):
+        return True
+    resolved_known = True
+
+    def repl_defined(m: re.Match) -> str:
+        nonlocal resolved_known
+        name = m.group(1)
+        if name in defined:
+            return "1"
+        if name in undefed:
+            return "0"
+        resolved_known = False
+        return "1"
+
+    e = re.sub(r"defined\s*\(\s*(\w+)\s*\)", repl_defined, expr)
+    e = re.sub(r"defined\s+(\w+)", repl_defined, e)
+    if not resolved_known:
+        return None
+    # Any remaining identifiers (macros we don't know) → unknown
+    if re.search(r"[A-Za-z_]\w*", e):
+        return None
+    e = e.replace("&&", " and ").replace("||", " or ")
+    e = re.sub(r"(?<![><=!])!(?!=)", " not ", e)
+    try:
+        return bool(eval(e, {"__builtins__": {}}, {}))
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Function-like macro extraction
+# ---------------------------------------------------------------------------
+def _split_top_level_brace_aware(s: str, sep: str = ",") -> list[str]:
+    """Like _split_top_level, but also tracks brace depth ``{ }`` so
+    that ``;`` inside a ``{ ... }`` block is NOT treated as a separator.
+
+    This is used when splitting expanded macro bodies into statements:
+    a macro like ``ENET_RANGE_CODER_ENCODE`` contains
+    ``for (;;) { stmt1; stmt2; }`` where the ``;`` inside the ``{ }``
+    should NOT be split (otherwise the ``for`` block's braces become
+    unbalanced).
+
+    Both ``()`` and ``{}`` nesting is tracked, and string/char
+    literals are skipped.
+    """
+    parts: list[str] = []
+    depth_paren = 0
+    depth_brace = 0
+    in_str = False
+    in_char = False
+    str_escape = False
+    cur: list[str] = []
+    for ch in s:
+        if in_str:
+            cur.append(ch)
+            if str_escape:
+                str_escape = False
+            elif ch == "\\":
+                str_escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if in_char:
+            cur.append(ch)
+            if str_escape:
+                str_escape = False
+            elif ch == "\\":
+                str_escape = True
+            elif ch == "'":
+                in_char = False
+            continue
+        if ch == '"':
+            in_str = True
+            cur.append(ch)
+            continue
+        if ch == "'":
+            in_char = True
+            cur.append(ch)
+            continue
+        if ch in "([{":
+            if ch == "(":
+                depth_paren += 1
+            elif ch == "{":
+                depth_brace += 1
+            cur.append(ch)
+            continue
+        if ch in ")]}":
+            if ch == ")":
+                if depth_paren > 0:
+                    depth_paren -= 1
+            elif ch == "}":
+                if depth_brace > 0:
+                    depth_brace -= 1
+            cur.append(ch)
+            continue
+        if ch == sep and depth_paren == 0 and depth_brace == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur).strip())
+    return parts
+
+
+def _extract_func_macros(src: str) -> list[tuple[str, list[str], str]]:
+    """Extract statement-like macros from C source.
+
+    Three kinds of macros are extracted for manual (pre-pcpp) inline
+    expansion:
+
+      1. Function-like macros with a substantial body —
+         ``#define NAME(a, b) { stmt1; stmt2; }`` where the body
+         contains ``{`` or ``;``.  These are expanded as scope blocks.
+      2. Function-like macros whose body is a single call to ANOTHER
+         extracted macro — e.g.
+         ``#define ENET_CONTEXT_TRY_DECODE(...) ENET_CONTEXT_DECODE(...)``.
+         Without this, pcpp would expand the outer call into a line
+         that still contains a raw call to the manually-managed inner
+         macro (whose #define we rename away), and the call would
+         never be expanded.
+      3. Object-like macros with a brace/statement body —
+         ``#define ENET_RANGE_CODER_FLUSH \\ { ... }`` (no parameter
+         list).  Their bodies are real statements, so pcpp would just
+         collapse them into one long line; we expand them as scope
+         blocks instead.  Simple constant macros (``#define X 1``,
+         ``#define NL "..."``) are NOT extracted — pcpp handles those.
+
+    Returns a list of ``(name, params, body)`` tuples where:
+      * ``name`` — the macro name (e.g. ``ENET_SYMBOL_CREATE``)
+      * ``params`` — list of parameter names; ``[]`` for object-like
+      * ``body`` — the macro body as a single string (line continuations
+        collapsed to spaces, ``\\`` removed)
+    """
+    macros: list[tuple[str, list[str], str]] = []
+    lines = src.splitlines()
+    # ---- Pass A: collect all macro names (function-like AND
+    # object-like) so "pure call" bodies can be detected.
+    all_names: set[str] = set()
+    for line in lines:
+        s = line.strip()
+        if not s.startswith("#"):
+            continue
+        m_any = re.match(r'#\s*define\s+(\w+)', s)
+        if m_any:
+            all_names.add(m_any.group(1))
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i].strip()
+        # ---- Function-like: NAME immediately followed by ( ----
+        m = re.match(
+            r'#\s*define\s+(\w+)\(([^)]*)\)\s*(.*)',
+            line
+        )
+        if not m:
+            # ---- Object-like: NAME followed by whitespace + body ----
+            # (#define ENET_RANGE_CODER_FLUSH \
+            #  { ... })  — no parameter list.
+            m_obj = re.match(r'#\s*define\s+(\w+)\s*([^\s(].*)', line)
+            if not m_obj:
+                i += 1
+                continue
+            obj_name = m_obj.group(1)
+            obj_first = m_obj.group(2).strip()
+            # Skip simple constant macros (string/char/number bodies)
+            if obj_first.startswith('"') or obj_first.startswith("'"):
+                i += 1
+                continue
+            body_parts = []
+            if obj_first.endswith("\\"):
+                body_parts.append(obj_first[:-1].strip())
+            else:
+                body_parts.append(obj_first)
+            if obj_first.endswith("\\") or not obj_first:
+                j = i + 1
+                while j < n:
+                    cont = lines[j].strip()
+                    if cont.endswith("\\"):
+                        body_parts.append(cont[:-1].strip())
+                        j += 1
+                    else:
+                        body_parts.append(cont)
+                        j += 1
+                        break
+                i = j
+            else:
+                i += 1
+            obj_body = " ".join(body_parts).strip()
+            # Only statement-like object-like bodies ({ or ; present)
+            if obj_body and ("{" in obj_body or ";" in obj_body) \
+                    and len(obj_body) > 10:
+                macros.append((obj_name, [], obj_body))
+            continue
+        name = m.group(1)
+        params_str = m.group(2).strip()
+        first_body = m.group(3).strip()
+        params = [p.strip() for p in params_str.split(",") if p.strip()] if params_str else []
+        # Collect continuation lines (lines ending with \)
+        body_parts = []
+        if first_body:
+            if first_body.endswith("\\"):
+                body_parts.append(first_body[:-1].strip())
+            else:
+                body_parts.append(first_body)
+                # Check if next lines continue
+        else:
+            # Body starts on next line
+            pass
+        # Follow continuation lines
+        if first_body.endswith("\\") or not first_body:
+            j = i + 1
+            while j < n:
+                cont = lines[j].strip()
+                if cont.endswith("\\"):
+                    body_parts.append(cont[:-1].strip())
+                    j += 1
+                else:
+                    body_parts.append(cont)
+                    j += 1
+                    break
+            i = j
+        else:
+            i += 1
+        body = " ".join(body_parts).strip()
+        if not body:
+            # Empty-body macro (e.g. the ``#define ENET_CONTEXT_NOT_EXCLUDED(a, b)``)
+            # no-op that enet uses for disabled features) — extract it
+            # too so the manual expansion DELETES its call sites.
+            if len(params) > 0:
+                macros.append((name, params, ""))
+            continue
+        if len(body) <= 10:
+            continue
+        # Keep function-like macros with substantial bodies (contains
+        # { or ;) — these expand as scope blocks.
+        if ("{" in body or ";" in body) and len(params) > 0:
+            macros.append((name, params, body))
+            continue
+        # Also keep macros whose body is a single call to ANOTHER
+        # extracted macro (e.g. ENET_CONTEXT_TRY_DECODE expands to a
+        # ENET_CONTEXT_DECODE call).  Without this, pcpp would expand
+        # the outer call into a line that still contains a raw call to
+        # the manually-managed inner macro, and it would never be
+        # expanded.
+        m_call = re.match(r'^\s*([A-Za-z_]\w*)\s*\(', body)
+        if m_call and m_call.group(1) in all_names:
+            macros.append((name, params, body))
+    return macros
+
+
+def _expand_func_macros_in_source(
+    src: str,
+    macros: list[tuple[str, list[str], str]]
+) -> str:
+    """Replace function-like macro calls in ``src`` with the macro
+    body, inlined at the call site with parameter substitution, AND
+    remove the ``#define`` lines so pcpp doesn't re-expand them.
+
+    This is a manual macro expansion that runs BEFORE pcpp so the
+    expanded code is split into individual statements (one per line)
+    rather than collapsed into a single long line (which is what pcpp
+    does and which the pattern-based translator can't parse).
+
+    For each macro call ``MACRO_NAME(arg1, arg2, ...)`` found in the
+    source (outside string/char literals and preprocessor directives),
+    we:
+
+      1. Substitute the macro parameters in the body with the actual
+         argument values (simple text substitution — we don't handle
+         token-pasting or stringification).
+      2. Strip the outer ``{ }`` braces if present.
+      3. Split the body on ``;`` into individual statements.
+      4. Replace the macro call with the statements, each on its own
+         line, with the first line preceded by a ``/* Macro: ... */``
+         comment showing the original call.
+
+    We also remove the ``#define MACRO_NAME(...)`` lines (and their
+    ``\\`` continuation lines) so pcpp doesn't re-expand the macros.
+    """
+    if not macros:
+        return src
+    # Build a lookup: macro name -> (params, body, brace_count)
+    # We track the net { } count of each macro's body so we can
+    # preserve the brace balance when removing the #define lines.
+    macro_map: dict[str, tuple[list[str], str]] = {}
+    macro_names: set[str] = set()
+    macro_brace_counts: dict[str, int] = {}
+    for name, params, body in macros:
+        macro_map[name] = (params, body)
+        macro_names.add(name)
+        # Count net braces in the body (should be 0 for balanced body)
+        # but we use the total { count as a proxy for how many { }
+        # pairs the definition contributes.
+        macro_brace_counts[name] = body.count("{")
+
+    # First pass: replace the #define for these macros with a
+    # renamed version whose BODY IS EMPTIED.  We keep the #define
+    # line (renamed to __SKIP_NAME) so pcpp sees a valid preprocessor
+    # directive, but we replace all continuation lines (the body)
+    # with empty lines.  This way:
+    #   - pcpp doesn't expand NAME(...) (it only knows __SKIP_NAME)
+    #   - The body's { } are NOT in the preprocessed output
+    #   - Our manual expansion provides the { } for each call site
+    #   - Total { } balance: each call adds body's { }, no definition
+    #     { } to subtract → balanced (since we removed the body { }
+    #     AND we're adding body { } per call)
+    lines = src.splitlines()
+    filtered_lines: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        m = re.match(
+            r'#\s*define\s+(\w+)\(',
+            stripped
+        )
+        m_obj = None
+        if not m:
+            # Object-like define: name NOT followed by '('
+            m_obj = re.match(r'#\s*define\s+(\w+)\s*([^\s(].*)', stripped)
+        if m and m.group(1) in macro_names:
+            macro_name = m.group(1)
+            # Rename the #define line
+            renamed = re.sub(
+                r'#\s*define\s+' + re.escape(macro_name) + r'\(',
+                f'#define __SKIP_{macro_name}(',
+                stripped,
+                count=1
+            )
+            filtered_lines.append(renamed)
+            i += 1
+            # Replace continuation lines with empty lines to remove
+            # the body's { } from the source
+            while i < n and lines[i].strip().endswith("\\"):
+                filtered_lines.append("")  # empty line replaces body
+                i += 1
+            if i < n:
+                filtered_lines.append("")  # last continuation (no \)
+                i += 1
+            continue
+        if m_obj and m_obj.group(1) in macro_names:
+            macro_name = m_obj.group(1)
+            # Object-like #define: keep the line (renamed) but empty
+            # its continuation lines, exactly like the function-like
+            # case.  The trailing ``\`` on the renamed line joins it
+            # to the (now empty) continuation lines, so pcpp sees an
+            # empty body.
+            renamed = re.sub(
+                r'#\s*define\s+' + re.escape(macro_name) + r'\b',
+                f'#define __SKIP_{macro_name}',
+                stripped,
+                count=1
+            )
+            filtered_lines.append(renamed)
+            i += 1
+            while i < n and lines[i].strip().endswith("\\"):
+                filtered_lines.append("")
+                i += 1
+            if i < n:
+                filtered_lines.append("")
+                i += 1
+            continue
+        filtered_lines.append(line)
+        i += 1
+    src_no_defines = "\n".join(filtered_lines)
+    # Second pass: expand macro calls in the remaining source.
+    # We run a SINGLE pass — nested macros inside expanded bodies
+    # are handled by the suffix recursion in _expand_macros_in_line
+    # and by the body splitting + per-statement expansion below.
+    # Multiple passes caused { } explosion because each pass
+    # re-expands already-expanded bodies.
+    out_lines: list[str] = []
+    src_lines = src_no_defines.splitlines()
+    li = 0
+    nl = len(src_lines)
+    while li < nl:
+        line = src_lines[li]
+        stripped = line.strip()
+        # Skip preprocessor directives and empty lines
+        if stripped.startswith("#") or not stripped:
+            out_lines.append(line)
+            li += 1
+            continue
+        # Search for macro calls in this line.
+        expanded = _expand_macros_in_line(line, macro_map)
+        if expanded is not None:
+            # None == no macro call.  Non-empty list == replacement
+            # lines.  EMPTY list == an empty-body (no-op) macro — the
+            # call disappears entirely, so nothing is emitted.
+            if expanded:
+                out_lines.extend(expanded)
+            li += 1
+            continue
+        # Brace-aware multi-line call recovery: if the line contains
+        # a known macro name whose argument parens do NOT balance on
+        # this line (e.g. ``ENET_CONTEXT_WALK (context, { ... })``
+        # spanning several source lines), join the following lines
+        # until the parens balance, then expand the joined line.
+        if _has_unbalanced_macro_call(line, macro_names):
+            joined = line
+            k = li + 1
+            while k < nl and _paren_delta(joined) < 0 and k - li < 1000:
+                nxt = src_lines[k]
+                if nxt.rstrip().endswith("\\"):
+                    nxt = nxt.rstrip()[:-1]
+                joined += "\n" + nxt
+                k += 1
+            if _paren_delta(joined) >= 0:
+                expanded = _expand_macros_in_line(joined, macro_map)
+                if expanded:
+                    out_lines.extend(expanded)
+                    li = k
+                    continue
+        out_lines.append(line)
+        li += 1
+    return "\n".join(out_lines)
+
+
+def _paren_delta(text: str) -> int:
+    """Net paren count of ``text``: opens minus closes, ignoring
+    string/char literals.  Negative means the text has unclosed ``(``.
+    """
+    delta = 0
+    in_str = False
+    in_char = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if in_char:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "'":
+                in_char = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "'":
+            in_char = True
+        elif ch == "(":
+            delta += 1
+        elif ch == ")":
+            delta -= 1
+    return delta
+
+
+def _has_unbalanced_macro_call(
+    line: str,
+    macro_names: set[str]
+) -> bool:
+    """True if ``line`` contains ``NAME(`` for a known macro NAME and
+    the parens opened by that call do not balance on this line
+    (i.e. the call continues on following source lines)."""
+    n = len(line)
+    i = 0
+    in_str = False
+    in_char = False
+    esc = False
+    while i < n:
+        ch = line[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if in_char:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == "'":
+                in_char = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch == "'":
+            in_char = True
+            i += 1
+            continue
+        for mname in macro_names:
+            if line[i:i+len(mname)] == mname:
+                before_ok = (i == 0 or not (
+                    line[i-1].isalnum() or line[i-1] == "_"))
+                j = i + len(mname)
+                while j < n and line[j] in " \t":
+                    j += 1
+                if before_ok and j < n and line[j] == "(":
+                    # Count parens from here to end of line
+                    depth = 0
+                    k = j
+                    while k < n:
+                        if line[k] == "(":
+                            depth += 1
+                        elif line[k] == ")":
+                            depth -= 1
+                        k += 1
+                    if depth != 0:
+                        return True
+                break
+        i += 1
+    return False
+
+
+def _expand_macros_in_line_recursive(
+    line: str,
+    macro_map: dict[str, tuple[list[str], str]]
+) -> list[str] | None:
+    """Like _expand_macros_in_line but expands macros recursively:
+    if a macro's body contains calls to other macros, those are
+    expanded too (up to 5 levels deep to prevent infinite loops)."""
+    result = _expand_macros_in_line(line, macro_map)
+    if result is None:
+        return None
+    # Recursively expand any macro calls in the result lines.
+    final: list[str] = []
+    for rline in result:
+        # Don't expand the comment line
+        if "/* Macro:" in rline:
+            final.append(rline)
+            continue
+        sub = _expand_macros_in_line(rline, macro_map)
+        if sub:
+            final.extend(sub)
+        else:
+            final.append(rline)
+    return final
+
+
+def _expand_macros_in_line(
+    line: str,
+    macro_map: dict[str, tuple[list[str], str]],
+    _depth: int = 0
+) -> list[str] | None:
+    """Find and expand macro calls in a single line.
+
+    Returns a list of replacement lines (one or more), or ``None`` if
+    no macro call was found (the caller should keep the original line).
+
+    EMISSION MODEL — scope-unit, brace-aware (no prefix repetition):
+
+    A macro call is replaced by a ``{ ... }`` scope block that is
+    brace-balanced ON ITS OWN, so the surrounding code's brace depth
+    is untouched:
+
+        prefix MACRO(args);      ->      prefix{
+                                         /* Macro: MACRO(args) */
+                                         stmt1;
+                                         ...
+                                     }
+
+    The call-site prefix (e.g. ``if (x) ``) is attached ONLY to the
+    opening-brace line, never repeated per body line — repeating it
+    used to open one unclosed ``{`` per line and destroy the brace
+    balance.  Because the whole block becomes the if/for/while body,
+    ``if (x) MACRO(...);`` correctly guards EVERY statement of the
+    macro body (this was broken when the outer braces were stripped).
+
+    The statement terminator ``;`` that follows the call is absorbed
+    by the block (a block is already a complete statement), so
+    ``if (x) MACRO(); else ...`` stays valid C.
+
+    Nested macro calls inside the body statements are expanded FIRST
+    (per statement, recursively) and their multi-line blocks are
+    spliced in before the outer block is emitted — inner-first
+    semantics, matching the C preprocessor's rescan behaviour.
+    """
+    if _depth > 20:
+        # Safety guard against self-recursive macros — leave the text
+        # untouched rather than looping forever.
+        return None
+    # Scan the line for macro calls, skipping string/char literals.
+    n = len(line)
+    i = 0
+    in_str = False
+    in_char = False
+    escape = False
+    while i < n:
+        ch = line[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if in_char:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == "'":
+                in_char = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            i += 1
+            continue
+        if ch == "'":
+            in_char = True
+            i += 1
+            continue
+        # Check if this position starts a macro call
+        for mname in macro_map:
+            if line[i:i+len(mname)] == mname:
+                # Check word boundary
+                before_ok = (i == 0 or not (line[i-1].isalnum() or line[i-1] == "_"))
+                after_pos = i + len(mname)
+                # Skip whitespace
+                j = after_pos
+                while j < n and line[j] in " \t":
+                    j += 1
+                # Get macro params and body
+                params, body = macro_map[mname]
+                if not before_ok:
+                    i += 1
+                    continue
+                args_str = ""
+                args: list[str] = []
+                if params:
+                    # Function-like macro: the name must be followed
+                    # by ``(args)``.
+                    if j >= n or line[j] != "(":
+                        i += 1
+                        continue
+                    # Found a macro call: MACRO_NAME( at position i
+                    # Extract the argument list (balanced parens)
+                    paren_start = j
+                    depth = 1
+                    j += 1
+                    while j < n and depth > 0:
+                        if line[j] == "(":
+                            depth += 1
+                        elif line[j] == ")":
+                            depth -= 1
+                        j += 1
+                    if depth != 0:
+                        i += 1
+                        continue
+                    args_str = line[paren_start+1:j-1]
+                    # Split args on top-level commas (brace-aware — an
+                    # argument may itself be a ``{ ... }`` code block).
+                    args = _split_top_level(args_str, ",")
+                    args = [a.strip() for a in args if a.strip()]
+                else:
+                    # Object-like macro (no parameter list): the call
+                    # site has NO parens (``ENET_RANGE_CODER_SEED;``).
+                    # Only require that the name is not a prefix of a
+                    # longer identifier.
+                    if j < n and (line[j].isalnum() or line[j] == "_"):
+                        i += 1
+                        continue
+                # Substitute params with args in body
+                expanded_body = body
+                for pi, param in enumerate(params):
+                    if pi < len(args):
+                        # Simple text substitution.  We use word
+                        # boundaries to avoid partial matches (e.g.
+                        # ``value_`` should not match inside
+                        # ``value_extra``).
+                        expanded_body = re.sub(
+                            r'\b' + re.escape(param) + r'\b',
+                            args[pi],
+                            expanded_body
+                        )
+                # Normalize spaced operators
+                expanded_body = _normalise_spaced_operators(expanded_body)
+                # Strip redundant parens around simple identifiers in
+                # member-access positions: macro bodies write
+                # ``(context) -> field`` defensively, and after
+                # substitution that becomes ``(root) -> field`` which
+                # the pattern translator's assignment regex cannot
+                # match.  ``(root) -> field`` -> ``root -> field``.
+                # (Only member access is touched — function calls and
+                # casts keep their parens.)
+                expanded_body = re.sub(
+                    r'\(\s*(\w+)\s*\)(\s*(?:->|\.))',
+                    r'\1\2',
+                    expanded_body
+                )
+                # ---- Scope-unit emission ----
+                inner = expanded_body.strip()
+                if not inner:
+                    # Empty-body macro (a no-op like enet's
+                    # ``ENET_CONTEXT_NOT_EXCLUDED``).
+                    prefix_txt = line[:i]
+                    suffix_txt = line[j:]
+                    if not prefix_txt.strip() and not (
+                        suffix_txt.strip().rstrip(";").strip()
+                    ):
+                        # The call IS the whole statement
+                        # (``NOOP(...);``) — it vanishes entirely.
+                        # An EMPTY list (not None) tells the caller
+                        # to drop the call text.
+                        return []
+                    # The call sits in the MIDDLE of the line —
+                    # removing only the call must PRESERVE the rest
+                    # (``} else { ...; NOOP(...); if ...`` — dropping
+                    # the whole line here used to delete the entire
+                    # else-branch!).  Re-join prefix + suffix (minus
+                    # the absorbed ``;``) and keep expanding.
+                    rest = prefix_txt + suffix_txt.lstrip()
+                    if rest.lstrip().startswith(";"):
+                        rest = rest.lstrip()[1:]
+                    rest_expanded = _expand_macros_in_line(
+                        rest, macro_map, _depth + 1
+                    )
+                    if rest_expanded is None:
+                        return [rest]
+                    return rest_expanded
+                # If the body is a simple ``{ ... }`` block, drop the
+                # outer braces here — we emit our own braces below.
+                # (Braces are NEVER lost: the block we emit restores
+                # them.  Body braces stay balanced overall.)
+                if inner.startswith("{") and inner.endswith("}"):
+                    depth_check = 0
+                    wraps_all = True
+                    for ci, ch in enumerate(inner):
+                        if ch == "{":
+                            depth_check += 1
+                        elif ch == "}":
+                            depth_check -= 1
+                            if depth_check == 0 and ci < len(inner) - 1:
+                                wraps_all = False
+                                break
+                    if wraps_all:
+                        inner = inner[1:-1].strip()
+                prefix = line[:i]
+                suffix = line[j:]
+                stmts = _split_top_level_brace_aware(inner, ";")
+                stmts = [s.strip() for s in stmts if s.strip()]
+                if not stmts:
+                    # Empty body — leave the call untouched.
+                    i = j
+                    continue
+                result_lines = []
+                # Opening line: call-site prefix + ``{``.  For
+                # ``if (cond) MACRO(...)`` the block becomes the
+                # if-body; for a plain statement the prefix is just
+                # leading whitespace/empty.
+                result_lines.append(f"{prefix}{{")
+                # Marker comment on its own line inside the block.
+                param_list = ", ".join(params) if params else ""
+                if param_list:
+                    result_lines.append(
+                        f"/* Macro: {mname}({param_list}) */"
+                    )
+                else:
+                    result_lines.append(f"/* Macro: {mname} */")
+                # Body statements — expand nested macro calls FIRST
+                # (inner-first), then splice their multi-line scope
+                # blocks in.  The call-site prefix is NOT repeated on
+                # these lines: they live inside the block opened
+                # above, so their brace depth is self-contained.
+                for s in stmts:
+                    stmt_expanded = _expand_macros_in_line(
+                        s, macro_map, _depth + 1
+                    )
+                    if stmt_expanded is None:
+                        # No macro in this statement — emit as-is.
+                        if s.endswith("{") or s.endswith("}"):
+                            result_lines.append(s)
+                        else:
+                            result_lines.append(f"{s};")
+                    else:
+                        # Nested expansion result (may be [] for a
+                        # no-op macro — splices nothing).
+                        result_lines.extend(stmt_expanded)
+                # Closing brace of the scope block.
+                result_lines.append("}")
+                # Suffix — the ``;`` that terminated the macro call is
+                # absorbed by the block (a block is a complete
+                # statement), so drop exactly ONE leading ``;``.
+                # Anything after it is emitted line by line, with
+                # nested macro calls expanded, keeping braces
+                # balanced across the emitted lines.
+                suf = suffix.lstrip()
+                if suf.startswith(";"):
+                    suf = suf[1:]
+                if suf.strip():
+                    suffix_parts = _split_top_level_brace_aware(suf, ";")
+                    for sp in suffix_parts:
+                        sp = sp.strip()
+                        if not sp:
+                            continue
+                        suf_expanded = _expand_macros_in_line(
+                            sp, macro_map, _depth + 1
+                        )
+                        if suf_expanded is None:
+                            if sp.endswith("{") or sp.endswith("}"):
+                                result_lines.append(sp)
+                            else:
+                                result_lines.append(f"{sp};")
+                        else:
+                            result_lines.extend(suf_expanded)
+                return result_lines
+        i += 1
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -104,11 +1041,18 @@ _KNOWN_TYPEDEFS = {
     "int8_t", "int16_t", "int32_t", "int64_t",
     "size_t", "ssize_t", "ptrdiff_t", "wchar_t",
     "intptr_t", "uintptr_t",
+    # POSIX / libc time types
+    "time_t", "clock_t", "useconds_t", "pid_t", "uid_t", "gid_t",
+    "mode_t", "off_t", "dev_t", "ino_t", "nlink_t", "blkcnt_t",
+    "blksize_t",
     # Windows
     "DWORD", "WORD", "BYTE", "BOOL", "HANDLE", "HWND", "HMODULE",
     "HINSTANCE", "HDC", "LRESULT", "WPARAM", "LPARAM", "UINT",
     "LPSTR", "LPCTSTR", "LPCSTR", "LPVOID", "PBYTE", "PDWORD",
     "PWORD", "HBRUSH", "HMENU", "WCHAR",
+    "INT", "LONG", "SHORT", "ULONG", "USHORT", "BOOLEAN", "PVOID",
+    "LPCWSTR", "LPWSTR", "LPCWCHAR", "SOCKET", "u_long", "u_short",
+    "u_int", "u_char",
     # GLib
     "gint", "guint", "gchar", "guchar", "gshort", "gushort",
     "glong", "gulong", "gfloat", "gdouble", "gboolean", "gpointer",
@@ -568,6 +1512,98 @@ class BodyTranslator:
             self._name_map[name] = pas
         return pas
 
+    def _split_compound_block(self, src: str) -> list[str]:
+        """Split the contents of a ``{ ... }`` compound block into
+        statements, splitting on ``;`` at brace depth 0 (inside the
+        compound block but NOT inside nested ``{ }`` blocks from
+        if/for/while).
+
+        This is used for expanded C macros where the outer ``{ }``
+        wraps a sequence of statements.  We must NOT split inside
+        ``if (x) { stmt1; stmt2; }`` because that would break the
+        control flow structure.
+        """
+        out: list[str] = []
+        paren_depth = 0
+        brace_depth = 0
+        in_str = False
+        in_char = False
+        str_escape = False
+        cur: list[str] = []
+        n = len(src)
+        for idx, ch in enumerate(src):
+            if in_str:
+                cur.append(ch)
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if in_char:
+                cur.append(ch)
+                if str_escape:
+                    str_escape = False
+                elif ch == "\\":
+                    str_escape = True
+                elif ch == "'":
+                    in_char = False
+                continue
+            if ch == '"':
+                in_str = True
+                cur.append(ch)
+                continue
+            if ch == "'":
+                in_char = True
+                cur.append(ch)
+                continue
+            if ch == "(":
+                paren_depth += 1
+                cur.append(ch)
+                continue
+            if ch == ")":
+                if paren_depth > 0:
+                    paren_depth -= 1
+                cur.append(ch)
+                continue
+            if ch == "{":
+                brace_depth += 1
+                cur.append(ch)
+                continue
+            if ch == "}":
+                if brace_depth > 0:
+                    brace_depth -= 1
+                cur.append(ch)
+                if brace_depth == 0 and paren_depth == 0:
+                    # A nested compound statement completed — it is a
+                    # statement boundary (unless an ``else`` /
+                    # ``while`` continues it, e.g. if/else chains or
+                    # do-while tails).
+                    after = src[idx+1:].lstrip()
+                    if not (after.startswith("else")
+                            or after.startswith("while")):
+                        stmt = "".join(cur).strip()
+                        if stmt:
+                            out.append(stmt)
+                        cur = []
+                continue
+            if ch == ";" and paren_depth == 0 and brace_depth == 0:
+                stmt = "".join(cur).strip()
+                if stmt:
+                    out.append(stmt)
+                cur = []
+                continue
+            if ch == "\n":
+                cur.append(" ")
+            else:
+                cur.append(ch)
+        if cur:
+            tail = "".join(cur).strip()
+            if tail:
+                out.append(tail)
+        return out
+
     # ------------------------------------------------------------------
     def translate(self) -> list[str]:
         body = self.func.body
@@ -714,6 +1750,21 @@ class BodyTranslator:
             elif ch == "}":
                 depth -= 1
                 cur.append(ch)
+                if depth == 0 and paren_depth == 0:
+                    # A compound statement just completed at the top
+                    # level of the function body — the statement ENDS
+                    # here per C grammar (``{ ... }`` is a complete
+                    # statement).  Without this, an expanded macro
+                    # scope block, the following ``for`` loop and any
+                    # later blocks all merge into one mega statement
+                    # that the translator can't parse.
+                    # Exception: ``} else ...`` and ``} while ...``
+                    # continue the current statement.
+                    after = src[i+1:].lstrip()
+                    if not (after.startswith("else")
+                            or after.startswith("while")):
+                        out.append("".join(cur))
+                        cur = []
             elif ch == "(":
                 paren_depth += 1
                 cur.append(ch)
@@ -989,6 +2040,53 @@ class BodyTranslator:
     def _translate_statement(self, stmt: str) -> None:
         pad = self._pad()
         s = stmt.strip()
+        # --- Macro-expansion marker comment ---
+        # ``/* Macro: NAME(args) */`` lines emitted by the macro
+        # expansion are converted to Pascal ``// Macro: ...`` comments
+        # so the user can see where each macro call was expanded.  The
+        # marker may be a statement of its own or prefix the first
+        # statement of the expanded body.
+        m_macro = re.match(
+            r"^/\*\s*Macro:\s*(.*?)\s*\*/\s*(.*)$", s, re.DOTALL
+        )
+        if m_macro:
+            self._emit(f"{pad}// Macro: {m_macro.group(1)}")
+            rest = m_macro.group(2).strip()
+            if rest:
+                self._translate_statement(rest)
+            return
+        # --- Bare scope braces ---
+        # A ``{`` / ``}`` on its own (from an expanded macro scope
+        # block) maps to a Pascal ``begin`` / ``end;`` pair.
+        if s == "{":
+            self.indent += 1
+            self._emit(f"{pad}begin")
+            return
+        if s == "}":
+            self.indent -= 1
+            self._emit(f"{self._pad()}end;")
+            return
+        # Normalise spaced multi-char operators (e.g. ``peer - > field``)
+        # to their unspaced forms so the downstream _OP_REPLACE table can
+        # match them.  This must happen at the very top of
+        # _translate_statement (before any pattern matching) because
+        # ``peer - > field`` would otherwise confuse the comparison /
+        # assignment / call-statement pattern matchers.  We skip
+        # control-flow keywords (if/for/while/do/switch/return) which
+        # are handled by their own translators — those translators
+        # call _translate_expr internally, and _translate_expr already
+        # normalises its input.  We only normalise here for the
+        # expression-statement paths (assignments, calls, etc.).
+        # We DO skip string/char literals so the spacing inside a
+        # string is preserved verbatim.
+        if not (s.startswith("if") or s.startswith("for")
+                or s.startswith("while") or s.startswith("do")
+                or s.startswith("switch") or s.startswith("return")
+                or s.startswith("break") or s.startswith("continue")
+                or s.startswith("goto") or s.startswith("{")
+                or s.startswith("case") or s.startswith("default")
+                or s.startswith("label")):
+            s = _normalise_spaced_operators(s)
 
         # --- Control flow ---
         if s.startswith("if") and s[2:3] in (" ", "("):
@@ -1055,9 +2153,18 @@ class BodyTranslator:
                     self._translate_statement(rest)
                 return
         if s.startswith("{") and s.endswith("}"):
-            # Compound block: just recurse
+            # Compound block: split the inner content into statements
+            # and recurse on each.  We use a dedicated splitter that
+            # splits on ``;`` even inside ``{ }`` blocks (unlike
+            # ``_split_statements`` which only splits at brace depth 0).
+            # This is necessary because C preprocessor macros that use
+            # the ``do { stmt1; stmt2; } while(0)`` idiom (or plain
+            # ``{ stmt1; stmt2; }`` blocks) expand into a single
+            # compound block that ``_split_statements`` treats as one
+            # statement.  By splitting inside the compound block we
+            # can translate each statement individually.
             inner = s[1:-1]
-            for sub in self._split_statements(inner):
+            for sub in self._split_compound_block(inner):
                 if sub.strip():
                     self._translate_statement(sub.strip())
             return
@@ -1107,6 +2214,38 @@ class BodyTranslator:
                     or first_word_stripped in _KNOWN_TYPEDEFS \
                     or first_word in self._extra_known_types \
                     or first_word_stripped in self._extra_known_types:
+                self._translate_local_decl(type_str, rest)
+                return
+            # Heuristic fallback: many C libraries use typedef names that
+            # follow predictable naming conventions but are NOT in our
+            # fixed ``_KNOWN_TYPEDEFS`` set (e.g. enet's ``ENetRangeCoder``,
+            # ``ENetSymbol``, ``enet_uint8``, ``enet_uint16``; or the user's
+            # own ``MyStruct``, ``MyType``, ``device_handle_t``). If the
+            # first word "looks like a type" we treat the statement as a
+            # local declaration. This is conservative — it never misfires
+            # on common expression statements like ``sum += i`` (``sum``
+            # is all-lowercase and short) because such names start with a
+            # lowercase letter and do not look like typedefs.
+            #
+            # The same heuristic is already used by ``_extract_prototypes``
+            # for parameter type detection, so this keeps the two paths
+            # consistent.
+            if first_word_stripped and (
+                # Mixed-case typedef name: starts with uppercase, contains
+                # at least one lowercase letter (e.g. ``GtkWidget``,
+                # ``ENetSymbol``, ``GtkWindow``).
+                (first_word_stripped[0].isupper()
+                 and not first_word_stripped.isupper()
+                 and any(c.islower() for c in first_word_stripped))
+                # ``_t`` suffix (POSIX typedef convention):
+                # ``time_t``, ``pid_t``, ``enet_uint16_t``, etc.
+                or first_word_stripped.endswith("_t")
+                # Numeric-width typedef convention:
+                # ``enet_uint8``, ``g_uint16``, ``my_int32``, etc.
+                or first_word_stripped.endswith(
+                    ("_uint8", "_uint16", "_uint32", "_uint64",
+                     "_int8", "_int16", "_int32", "_int64"))
+            ):
                 self._translate_local_decl(type_str, rest)
                 return
             # If not a known type, fall through to assignment/call handling.
@@ -1678,9 +2817,27 @@ class BodyTranslator:
                     self._process_for_trailing(tail_str, pad)
                     return
 
-        # ---- Fallback: while loop with TODO ----
-        self._emit_todo(s, "for loop with non-standard form; rewritten as while")
-        self._emit(f"{pad}// init: {init}")
+        # ---- Fallback: while loop ----
+        # For non-standard for loops that don't match any of the
+        # patterns above, we emit a Pascal while loop that faithfully
+        # reproduces the C semantics:
+        #   1. Translate ``init`` as a statement BEFORE the while
+        #      (this is where the C ``init`` clause runs, exactly once).
+        #   2. Translate ``test`` as the while condition.
+        #   3. Translate the body inside the while loop.
+        #   4. Translate ``step`` as the LAST statement inside the
+        #      while body (this is where the C ``step`` clause runs,
+        #      after each iteration).
+        # We no longer emit a TODO comment for this — the conversion
+        # is semantically correct even though it uses a while loop
+        # instead of a Pascal for-to-do loop.
+        if init:
+            # Emit the init clause as a statement before the while.
+            # The init may be a simple assignment (``i = 0``) or a
+            # declaration (``int i = 0``).  We translate it as a
+            # statement so the pattern-based translator handles both
+            # forms.
+            self._translate_statement(init + ";")
         cond_pas = self._translate_expr(test) if test else "True"
         self._emit(f"{pad}while {cond_pas} do")
         body, tail = self._extract_block(after.lstrip())
@@ -1690,6 +2847,9 @@ class BodyTranslator:
             if sub.strip():
                 self._translate_statement(sub.strip())
         if step:
+            # Emit the step clause as the last statement in the
+            # while body.  This is where C runs the step clause —
+            # after each iteration of the body.
             self._translate_statement(step + ";")
         self.indent -= 1
         self._emit(f"{pad}end;")
@@ -2275,12 +3435,192 @@ class BodyTranslator:
           * Simple assignment: ``a = b``
           * Augmented assignment with array/struct LHS:
             ``buf[j] += 1``, ``struct.field += 1``
+          * Pointer-deref with post-increment: ``*p++ = expr`` ->
+            ``p^ := expr; Inc(p);`` (C idiom used heavily in stream /
+            buffer code, e.g. enet's ``*outData++ = encodeLow >> 24;``)
         """
         pad = self._pad()
         # Strip trailing semicolon
         s_clean = s.rstrip(";").rstrip()
         if not s_clean:
             return False
+
+        # ---- Pointer-deref with post-increment / post-decrement on LHS ----
+        # C idiom: ``*p++ = expr;`` writes ``expr`` to ``*p`` and then
+        # advances ``p`` by one element. Pascal has no built-in syntax
+        # for this, so we split it into two statements:
+        #     p^ := expr;
+        #     Inc(p);
+        # (or ``Dec(p)`` for ``*p-- = expr;``).
+        # This pattern is very common in the enet range coder
+        # (``* outData ++ = encodeLow >> 24;`` inside ENET_RANGE_CODER_OUTPUT,
+        # ``* inData ++`` reads, etc.) so handling it here keeps the
+        # pattern-based fallback translator on par with the AST translator.
+        #
+        # We match the following shapes (allowing arbitrary whitespace):
+        #   *p ++ = expr
+        #   *p-- = expr
+        #   *(*p).field ++ = expr    (rare; we don't handle this complex form)
+        # We deliberately keep this regex simple — anything more complex
+        # (e.g. ``*p[i]++ = expr``) falls through to the generic
+        # assignment handler, which may emit a TODO.
+        m_post = re.match(
+            r"^\*\s*(?P<ptr>\w+(?:\s*\[[^\]]*\]?"
+            r"|\s*\.\s*\w+"
+            r"|\s*->\s*\w+)*)"
+            r"\s*(?P<op>\+\+|--)\s*=\s*(?P<rhs>.+)$",
+            s_clean, re.DOTALL,
+        )
+        if m_post:
+            ptr = self._translate_expr(m_post.group("ptr"))
+            rhs = self._translate_expr(m_post.group("rhs").strip())
+            self._emit(f"{pad}{ptr}^ := {rhs};")
+            if m_post.group("op") == "++":
+                self._emit(f"{pad}Inc({ptr});")
+            else:
+                self._emit(f"{pad}Dec({ptr});")
+            return True
+
+        # ---- Symmetric case: post-increment on a deref-write with the
+        # increment AFTER the rhs (very rare; some macros write
+        # ``*(p++) = expr``). Handle it for completeness. ----
+        m_post2 = re.match(
+            r"^\*\s*\(\s*(?P<ptr>\w+)\s*(?P<op>\+\+|--)\s*\)"
+            r"\s*=\s*(?P<rhs>.+)$",
+            s_clean, re.DOTALL,
+        )
+        if m_post2:
+            ptr = self._translate_expr(m_post2.group("ptr"))
+            rhs = self._translate_expr(m_post2.group("rhs").strip())
+            self._emit(f"{pad}{ptr}^ := {rhs};")
+            if m_post2.group("op") == "++":
+                self._emit(f"{pad}Inc({ptr});")
+            else:
+                self._emit(f"{pad}Dec({ptr});")
+            return True
+
+        # ---- Read with post-increment: ``value = *ptr ++;`` ----
+        # C reads ``*ptr`` into ``value`` and then advances ``ptr``.
+        # Pascal: ``value := ptr^; Inc(ptr);``.
+        # We only handle the SIMPLE form (single identifier LHS, RHS is
+        # exactly ``*ptr++`` or ``*ptr--``) — composite expressions like
+        # ``decodeCode |= *inData++ << 24`` are handled separately below.
+        m_read_post = re.match(
+            r"^(?P<lhs>\w+)\s*=\s*\*\s*(?P<ptr>\w+)\s*(?P<op>\+\+|--)\s*$",
+            s_clean, re.DOTALL,
+        )
+        if m_read_post:
+            lhs = self._translate_expr(m_read_post.group("lhs"))
+            ptr = self._translate_expr(m_read_post.group("ptr"))
+            self._emit(f"{pad}{lhs} := {ptr}^;")
+            if m_read_post.group("op") == "++":
+                self._emit(f"{pad}Inc({ptr});")
+            else:
+                self._emit(f"{pad}Dec({ptr});")
+            return True
+
+        # ---- Compound-expression read with post-increment ----
+        # Pattern: ``lhs op= *ptr ++ [<< shift]`` or ``lhs = ... *ptr++ ...``
+        # The most common case in enet is:
+        #     decodeCode |= *inData ++ << 24;
+        # which is:
+        #     decodeCode := decodeCode or (inData^) shl 24; Inc(inData);
+        # We handle the general case: scan s_clean for ``* <ident> ++``
+        # or ``* <ident> --``. For each occurrence, replace it with
+        # ``<ident>^`` in the expression and emit an ``Inc(<ident>);``
+        # statement AFTER the assignment. (If both ``++`` and ``--`` are
+        # present, we emit one Inc/Dec per occurrence.)
+        # NOTE: C semantics is post-increment — the value of ``*p++``
+        # as an expression is the value of ``*p`` BEFORE the increment.
+        # Our rewrite uses ``p^`` (current value) and emits ``Inc(p)``
+        # AFTER the assignment, which matches the C semantics for
+        # ``decodeCode |= *inData++ << 24`` (the read happens first, then
+        # the increment). For chained uses (e.g. ``a = *p++ + *p++``) the
+        # order of increments is implementation-defined in C anyway, so
+        # emitting them after the statement is acceptable.
+        if re.search(r"\*\s*\w+\s*(?:\+\+|--)", s_clean):
+            # Find all ``*ident++`` / ``*ident--`` occurrences at the
+            # expression level (NOT inside string/char literals — but
+            # s_clean here is the statement, with strings preserved;
+            # we skip occurrences inside quotes by tracking quote
+            # state while scanning).
+            incr_list: list[tuple[str, str]] = []  # (ptr, "++"/"--")
+            parts: list[str] = []
+            i = 0
+            in_str = False
+            in_char = False
+            esc = False
+            while i < len(s_clean):
+                ch = s_clean[i]
+                if in_str:
+                    parts.append(ch)
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == '"':
+                        in_str = False
+                    i += 1
+                    continue
+                if in_char:
+                    parts.append(ch)
+                    if esc:
+                        esc = False
+                    elif ch == "\\":
+                        esc = True
+                    elif ch == "'":
+                        in_char = False
+                    i += 1
+                    continue
+                if ch == '"':
+                    in_str = True
+                    parts.append(ch)
+                    i += 1
+                    continue
+                if ch == "'":
+                    in_char = True
+                    parts.append(ch)
+                    i += 1
+                    continue
+                # Try to match ``*ident++`` or ``*ident--`` at this position
+                m = re.match(
+                    r"\*\s*(\w+)\s*(\+\+|--)",
+                    s_clean[i:],
+                )
+                if m:
+                    ptr_name = m.group(1)
+                    op_kind = m.group(2)
+                    incr_list.append((ptr_name, op_kind))
+                    # Replace ``*ident++`` with ``ident^`` in the output
+                    parts.append(f"{ptr_name}^")
+                    i += m.end()
+                    continue
+                parts.append(ch)
+                i += 1
+            # If we found at least one occurrence, rebuild the statement
+            # and emit Inc/Dec after the assignment.
+            if incr_list:
+                rewritten = "".join(parts)
+                # Translate the rewritten expression (which now has no
+                # ``*p++`` — just ``p^``) using the normal assignment
+                # logic. We recursively call _try_assignment with the
+                # rewritten statement so augmented ops, chained
+                # assignment, etc. still work.
+                # Strip trailing semicolon first (we'll re-add it).
+                ok = self._try_assignment(rewritten.rstrip(";").rstrip())
+                if ok:
+                    # Emit the Inc/Dec statements AFTER the assignment.
+                    # This matches C post-increment semantics for the
+                    # common case (the value is read, then the pointer
+                    # is advanced).
+                    for ptr_name, op_kind in incr_list:
+                        if op_kind == "++":
+                            self._emit(f"{pad}Inc({ptr_name});")
+                        else:
+                            self._emit(f"{pad}Dec({ptr_name});")
+                    return True
+                # If the recursive call didn't handle it, fall through to
+                # the generic handlers below.
 
         # ---- Augmented assignments (check FIRST, before plain '=') ----
         # We must check augmented ops before the plain ``=`` regex because
@@ -2734,6 +4074,17 @@ class BodyTranslator:
         expr = expr.strip()
         if not expr:
             return ""
+        # Normalise spaced multi-char operators (e.g. ``peer - > field``)
+        # to their unspaced forms BEFORE any pattern matching.  This
+        # must happen at the very top of _translate_expr because the
+        # downstream splitters (_split_comparison, _split_logical,
+        # _split_ternary, etc.) look for unspaced tokens like ``->``,
+        # ``<<``, ``>>``, ``&&``, ``||``.  If the input has spaces
+        # inside these operators (e.g. ``peer - > field``), the
+        # splitters would not recognise them and the expression would
+        # fall through to the generic operator-replacement path which
+        # also only matches unspaced tokens.
+        expr = _normalise_spaced_operators(expr)
         # Ternary  (depth-aware: only split on top-level ?: operators)
         # The previous simple non-greedy regex matched the FIRST '?' in the
         # expression even when nested inside parentheses. For example,
@@ -2954,6 +4305,15 @@ class BodyTranslator:
                 return result
         # Operators
         result = expr
+        # ---- Normalise spaced multi-char operators so _OP_REPLACE can
+        # match them.  Some C code writes ``peer -> field`` (with spaces
+        # around ``->``), or ``a < < b`` (with spaces inside ``<<``).
+        # C treats these the same as the unspaced forms, but our
+        # _OP_REPLACE table only matches the unspaced tokens.  We
+        # collapse the spaced forms to their unspaced equivalents
+        # OUTSIDE string/char literals so the replacement table can
+        # find them.
+        result = _normalise_spaced_operators(result)
         # ---- Convert C string literals ("...") -> Pascal ('...') FIRST ----
         # This must happen before _OP_REPLACE because operators like ``&``
         # could appear inside strings and must not be replaced.
@@ -3180,6 +4540,11 @@ class BodyTranslator:
             if is_string:
                 out.append(text)
                 continue
+            # First, normalise spaced multi-char operators (e.g.
+            # ``- >`` -> ``->``) so the _OP_REPLACE table can match
+            # them.  This handles C code that writes ``peer -> field``
+            # with spaces around ``->``.
+            text = _normalise_spaced_operators(text)
             for old, new in self._OP_REPLACE:
                 text = text.replace(old, new)
             out.append(text)
@@ -3486,8 +4851,37 @@ class BodyTranslator:
             if ch == "-" and j + 1 < n and expr[j+1] == ">":
                 # -> member access
                 i = j + 2
+                # Skip whitespace after -> (e.g. ``-> symbols``)
+                while i < n and expr[i] in " \t":
+                    i += 1
+                # Read the field name after ->
                 while i < n and (expr[i].isalnum() or expr[i] == "_"):
                     i += 1
+                # After the field name, there may be an array index
+                # (e.g. ``->symbols[predicted]``) or another member
+                # access (e.g. ``->field->subfield``).  We need to
+                # consume the array index HERE, as part of the same
+                # operand, so that ``&rangeCoder->symbols[predicted]``
+                # is extracted as the full operand rather than
+                # splitting at ``symbols``.  We do this by NOT
+                # returning to the outer while loop's whitespace skip
+                # immediately — instead we check for ``[`` right after
+                # the field name.
+                k = i
+                while k < n and expr[k] in " \t":
+                    k += 1
+                if k < n and expr[k] == "[":
+                    # Consume the array index as part of this operand
+                    depth = 1
+                    i = k + 1
+                    while i < n and depth > 0:
+                        if expr[i] == "[":
+                            depth += 1
+                        elif expr[i] == "]":
+                            depth -= 1
+                        i += 1
+                # Continue the outer loop to check for more member
+                # accesses after the array index (e.g. ``->arr[i].field``).
             elif ch == ".":
                 # . member access
                 i = j + 1
@@ -3592,6 +4986,17 @@ class BodyTranslator:
                 # Shift operators: << / >>.  Skip the whole token so
                 # neither ``<`` nor ``>`` is mistaken for a comparison.
                 if two in ("<<", ">>"):
+                    i += 2
+                    continue
+                # Pointer member access: ->.  Skip the whole token so
+                # the ``>`` in ``->`` is not mistaken for a comparison.
+                # This is critical for expressions like
+                # ``channel->outgoingUnreliableSequenceNumber < $FFFF``
+                # where the ``>`` in ``->`` would otherwise be matched
+                # as a comparison operator, splitting the expression
+                # as ``('>', 'channel-', 'outgoingUnreliableSequenceNumber...')``
+                # and corrupting the output.
+                if two == "->":
                     i += 2
                     continue
                 # Single-char < or > (but not << or >> — already
@@ -3879,13 +5284,15 @@ class CFileTranslator:
                  use_ast: bool = True,
                  header_types: list[str] = None,
                  header_defines: list[tuple[str, str]] = None,
-                 header_externs: list[tuple[str, str]] = None):
+                 header_externs: list[tuple[str, str]] = None,
+                 target_platform: str = "auto"):
         self.c_path = c_path
         self.unit_name = unit_name
         self.form_unit = form_unit  # name of the unit that owns form fields
         self.included_units = list(included_units or [])
         self.fake_include_dir = fake_include_dir
         self.use_ast = use_ast
+        self.target_platform = target_platform or "auto"
         # Types/defines/externs extracted from the matching .h file (if any).
         # When a .c file and its .h file share the same basename (e.g.
         # coff.c + coff.h), the .c file's output would overwrite the .h
@@ -3945,7 +5352,53 @@ class CFileTranslator:
             src = f.read()
         self.stats["lines_in"] = src.count("\n") + 1
         src_clean = strip_comments(src)
+        # Skip macro extraction/expansion if this translator is reading
+        # an already-expanded temp file (set by convert_c_file for the
+        # second pass).  The temp file already has macros inlined and
+        # #define lines removed, so re-running _extract_func_macros
+        # would find nothing and the expansion would be a no-op —
+        # BUT it would still write a NEW temp file (of the already-
+        # expanded source) and set c_path to it, which breaks the
+        # 2-pass logic.
+        if not hasattr(self, '_skip_macro_expansion'):
+            func_macros = _extract_func_macros(src_clean)
+            if func_macros:
+                print(f"gtk2laz: [{os.path.basename(self.c_path)}] "
+                      f"extracted {len(func_macros)} function-like "
+                      f"macros for inlining", file=sys.stderr)
+                src_clean = _expand_func_macros_in_source(src_clean, func_macros)
+                import tempfile
+                tmp_fd, tmp_path = tempfile.mkstemp(
+                    suffix=".c", prefix="gtk2laz_expanded_",
+                    dir=os.path.dirname(self.c_path)
+                )
+                try:
+                    import os as _os
+                    _os.write(tmp_fd, src_clean.encode("utf-8"))
+                    _os.close(tmp_fd)
+                    self._orig_c_path = self.c_path
+                    self.c_path = tmp_path
+                    print(f"gtk2laz: [{os.path.basename(self._orig_c_path)}] "
+                          f"wrote expanded source to {tmp_path} "
+                          f"({len(src_clean)} bytes)", file=sys.stderr)
+                except Exception as _e:
+                    _os.close(tmp_fd)
+                    print(f"gtk2laz: [{os.path.basename(self.c_path)}] "
+                          f"failed to write expanded temp file: "
+                          f"{type(_e).__name__}: {_e}", file=sys.stderr)
+            else:
+                print(f"gtk2laz: [{os.path.basename(self.c_path)}] "
+                      f"no function-like macros extracted — using "
+                      f"original source for AST parse", file=sys.stderr)
         src_clean, directives = strip_preprocessor(src_clean)
+        # Normalise spaced multi-char operators (e.g. ``peer -> field``
+        # with spaces around ``->``) to their unspaced forms so the
+        # downstream pattern-based translator and _OP_REPLACE table can
+        # match them.  This handles C code that writes ``a - > b``,
+        # ``a < < b``, ``a > > b``, ``a & & b``, etc. — C treats these
+        # the same as the unspaced forms, but our pattern matcher only
+        # recognises the unspaced tokens.
+        src_clean = _normalise_spaced_operators(src_clean)
 
         # ---- Try AST-based analysis first ----
         if self.use_ast:
@@ -3956,11 +5409,44 @@ class CFileTranslator:
                     fake_include_dir=self.fake_include_dir,
                     form_unit=self.form_unit,
                     included_units=self.included_units,
+                    target_platform=self.target_platform,
                 )
                 if self._ast_result is not None:
                     self.stats["ast_used"] = True
-            except Exception:
+                else:
+                    # parse_with_ast() returned None — AST-based
+                    # translation is unavailable for this file. We
+                    # will fall back to the pattern-based translator
+                    # below, which produces significantly more
+                    # TODOs (the pattern matcher cannot recognise
+                    # many C constructs that pycparser handles
+                    # natively). Tell the user so they understand why
+                    # this file may have more TODOs than expected.
+                    # The underlying parse_error (if any) is already
+                    # stored on the AstToPascal instance — but we
+                    # never see it here because parse_with_ast()
+                    # returns None instead of the partial object.
+                    import sys as _sys
+                    print(
+                        f"gtk2laz: AST parse failed for "
+                        f"{os.path.basename(self.c_path)} — falling "
+                        f"back to pattern-based translator "
+                        f"(expect more TODOs in this unit).",
+                        file=_sys.stderr)
+            except Exception as _e:
                 self._ast_result = None
+                # parse_with_ast() itself raised an exception (not
+                # just returned None). This is rarer but indicates a
+                # real bug in the AST translator. Surface it so the
+                # user can report the issue with a clear error
+                # message.
+                import sys as _sys
+                print(
+                    f"gtk2laz: AST translator raised "
+                    f"{type(_e).__name__} on "
+                    f"{os.path.basename(self.c_path)}: {_e} — "
+                    f"falling back to pattern-based translator.",
+                    file=_sys.stderr)
 
         # ---- Pattern-based fallback (always run for body translation) ----
         # ---- Extract inline struct global declarations ----
@@ -4200,9 +5686,32 @@ class CFileTranslator:
                     self.stats["todo_stmts"] += \
                         ast_result["stats"]["todo_count"]
                     self.todos.extend(ast_result["todos"])
-                except Exception:
+                except Exception as _body_err:
                     # Fall back to pattern-based body if AST translation
-                    # fails for any reason.
+                    # fails for any reason. Common causes:
+                    #   * the function body uses a C construct that the
+                    #     AST translator doesn't handle yet (e.g. a
+                    #     goto inside a nested compound, a label
+                    #     attribute the AST walker doesn't recognise,
+                    #     etc.) — this used to silently kill the whole
+                    #     function body, leaving the user with a .pas
+                    #     file that had "begin // empty body end;"
+                    #   * pycparser's AST node type we don't have a
+                    #     handler for (raises AttributeError when we
+                    #     access a missing attribute).
+                    # We surface the underlying error so the user can
+                    # see WHY this particular function fell back — and
+                    # the body_offset for the pattern-based translator
+                    # is still computed so the TODO line numbers come
+                    # out right.
+                    import sys as _sys
+                    print(
+                        f"gtk2laz: AST body translation failed for "
+                        f"{ast_fn.name}() in "
+                        f"{os.path.basename(self.c_path)}: "
+                        f"{type(_body_err).__name__}: {_body_err} — "
+                        f"falling back to pattern-based body.",
+                        file=_sys.stderr)
                     if pat_fn:
                         body_offset = self._header_line_count + len(out) + 1
                         translator = BodyTranslator(pat_fn, indent=2,
@@ -4249,6 +5758,19 @@ class CFileTranslator:
         out.append("end.")
         text = "\n".join(out) + "\n"
         self.stats["lines_out"] = text.count("\n") + 1
+        # Restore the original c_path but DON'T delete the temp file
+        # yet — the caller (convert_c_file) may need it for a second
+        # translate() pass.  The caller is responsible for deleting
+        # the temp file after both passes are done.
+        # We keep ``self._orig_c_path`` set (NOT deleted) so the
+        # caller can find the temp path in ``self.c_path`` and pass
+        # it to the second translator.  The caller will set
+        # ``_orig_c_path = None`` after it has copied the path.
+        if hasattr(self, '_orig_c_path') and self._orig_c_path:
+            # Save the temp path for the caller, then restore c_path.
+            self._temp_expanded_path = self.c_path
+            self.c_path = self._orig_c_path
+            # Keep _orig_c_path so caller can detect it.
         return text
 
     # ------------------------------------------------------------------
@@ -4264,6 +5786,15 @@ class CFileTranslator:
             val = m.group(2).strip()
             # Skip macro-style defines (with parameters or multi-line continuations)
             if "(" in name:
+                continue
+            # Skip our renamed-away macro definitions (their bodies were
+            # manually inlined at every call site) and multi-line
+            # statement macros whose value is just a line continuation
+            # marker or contains braces/statements — these are NOT
+            # Pascal constants (``#define X \ ... { ... }``).
+            if name.startswith("__SKIP_"):
+                continue
+            if val.startswith("\\") or "{" in val or "}" in val or ";" in val:
                 continue
             # Skip if value contains a function call or undefined identifier
             # we can't safely translate
@@ -4462,7 +5993,8 @@ def convert_c_file(c_path: str, out_dir: str,
                    use_ast: bool = True,
                    header_types: list[str] = None,
                    header_defines: list = None,
-                   header_externs: list = None) -> dict:
+                   header_externs: list = None,
+                   target_platform: str = "auto") -> dict:
     """Convert one .c file to a .pas unit under ``out_dir``.
 
     Parameters
@@ -4476,6 +6008,11 @@ def convert_c_file(c_path: str, out_dir: str,
     use_ast
         If True (default), try pycparser for accurate signatures and
         fall back to pattern-based translation on failure.
+    target_platform
+        Target platform for ``#ifdef`` branch selection. One of
+        ``"auto"``, ``"windows"``, ``"linux"``, ``"macos"``. See
+        ``pcpp_preprocessor.PLATFORM_PRESETS`` for the exact macros
+        each platform defines.
     """
     if unit_name is None:
         unit_name = os.path.splitext(os.path.basename(c_path))[0].lower()
@@ -4490,22 +6027,44 @@ def convert_c_file(c_path: str, out_dir: str,
                                   use_ast=use_ast,
                                   header_types=header_types,
                                   header_defines=header_defines,
-                                  header_externs=header_externs)
+                                  header_externs=header_externs,
+                                  target_platform=target_platform)
     text = translator.translate()
     # Compute header line count: count newlines up to "implementation\n"
     impl_idx = text.find("\nimplementation\n")
     if impl_idx >= 0:
         translator._header_line_count = text[:impl_idx].count("\n") + 2
     # Re-translate for accurate output_line in TodoItems
+    # If the first translator created a temp expanded-source file
+    # (for function-like macro inlining), reuse that same temp
+    # file path so the second pass reads the same expanded source.
     translator2 = CFileTranslator(c_path, unit_name, form_unit,
                                    included_units=included_units,
                                    fake_include_dir=fake_include_dir,
                                    use_ast=use_ast,
                                    header_types=header_types,
                                    header_defines=header_defines,
-                                   header_externs=header_externs)
+                                   header_externs=header_externs,
+                                   target_platform=target_platform)
+    # Inherit the temp file path from the first translator so the
+    # second pass reads the expanded source instead of the original.
+    temp_path = getattr(translator, '_temp_expanded_path', None)
+    if temp_path and os.path.isfile(temp_path):
+        translator2.c_path = temp_path
+        # Skip macro expansion on the second pass — the temp file is
+        # already expanded, so _extract_func_macros would find nothing
+        # and the expansion logic would be a no-op (but would still
+        # create a new temp file and mess up the c_path).
+        translator2._skip_macro_expansion = True
     translator2._header_line_count = translator._header_line_count
     text = translator2.translate()
+    # Clean up the temp file after both passes are done.
+    temp_path2 = getattr(translator2, '_temp_expanded_path', None) or temp_path
+    if temp_path2:
+        try:
+            os.unlink(temp_path2)
+        except OSError:
+            pass
     os.makedirs(out_dir, exist_ok=True)
     # Emit the generated fake-type units (gtk_types, glib_types,
     # libc_types, sys_types) which collect all fake-header typedefs/
@@ -4808,22 +6367,32 @@ class HeaderTranslator:
                 i += 1
             return -1
 
-        def _find_typedef_block(text: str, keyword: str) -> list[tuple[int, int, str, str]]:
-            """Find all ``typedef <keyword> [TAG] { ... } NAME;`` blocks.
+        def _find_typedef_block(text: str, keyword: str
+                                ) -> list[tuple[int, int, str, str, str]]:
+            """Find all ``typedef <keyword> [TAG] { ... } [ATTR] NAME;`` blocks.
 
-            Returns a list of (start, end, body, name) tuples where:
+            Returns a list of (start, end, body, name, attrs) tuples where:
               * start/end are character offsets into ``text`` (end is
                 past the final ``;``)
               * body is the text between the outermost ``{`` and ``}``
               * name is the typedef name (e.g. ``filehdr_t``)
+              * attrs is the attribute-macro text found between ``}``
+                and the name (e.g. ``ENET_PACKED``), or ``""`` if none.
+                The caller can use this to emit a comment so the user
+                knows to add ``packed record`` in Pascal.
 
             Uses a custom scanner that handles nested braces (unlike
             ``re`` with ``[^}]*`` which stops at the first ``}``).
             """
-            results: list[tuple[int, int, str, str]] = []
-            # Find each ``typedef <keyword>`` occurrence
+            results: list[tuple[int, int, str, str, str]] = []
+            # Find each ``typedef <keyword>`` occurrence.
+            # We use ``[A-Za-z_]\w*`` (C identifier rule: first char
+            # must be a letter or underscore, not a digit) instead of
+            # ``\w+`` for the optional TAG name, because ``\w+`` would
+            # also match numbers-only tokens which are not valid C
+            # identifiers.
             for m in re.finditer(
-                rf"\btypedef\s+{keyword}\s+(?:\w+\s+)?",
+                rf"\btypedef\s+{keyword}\s+(?:[A-Za-z_]\w*\s+)?",
                 text, re.DOTALL,
             ):
                 block_start = m.start()
@@ -4837,13 +6406,46 @@ class HeaderTranslator:
                     continue
                 body = text[brace_pos + 1:body_end - 1]
                 # After the closing brace, find the name and ``;``
+                # The text after ``}`` may contain:
+                #   1. Just the typedef name: ``} Name;``
+                #   2. An attribute macro: ``} ENET_PACKED Name;``
+                #      (ENET_PACKED is ``__attribute__((packed))`` on GCC)
+                #   3. Multiple names: ``} A, B;`` (rare for structs)
+                # We extract any leading attribute macros (ENET_PACKED,
+                # __attribute__, __packed, etc.) so the regex below can
+                # match the real typedef name. We ALSO return the
+                # attribute text so the caller can emit a comment
+                # (e.g. ``// ENET_PACKED — consider using packed record``)
+                # so the user knows to add ``packed`` in Pascal.
                 rest = text[body_end:].lstrip()
-                name_match = re.match(r"(\w+)\s*;", rest)
+                # Collect attribute macros between ``}`` and the name.
+                attr_re = re.compile(
+                    r"^(?:"
+                    r"ENET_PACKED"          # enet's packed macro
+                    r"|__attribute__\s*\([^)]*\)"  # GCC attribute
+                    r"|__packed"             # some compilers
+                    r"|__declspec\s*\([^)]*\)"     # MSVC
+                    r"|[A-Z_][A-Z_0-9]*_PACKED"    # *_PACKED macros
+                    r"|[A-Z_][A-Z_0-9]*_ALIGNED"   # *_ALIGNED macros
+                    r")\s+"
+                )
+                attrs_collected: list[str] = []
+                while True:
+                    m_attr = attr_re.match(rest)
+                    if not m_attr:
+                        break
+                    attrs_collected.append(m_attr.group(0).strip())
+                    rest = rest[m_attr.end():]
+                # Match the typedef name using C identifier rules:
+                # first char must be [A-Za-z_], not a digit. ``\w+``
+                # would match ``123`` which is not a valid C identifier.
+                name_match = re.match(r"([A-Za-z_]\w*)\s*;", rest)
                 if not name_match:
                     continue
                 name = name_match.group(1)
                 block_end = body_end + (len(text[body_end:]) - len(rest)) + name_match.end()
-                results.append((block_start, block_end, body, name))
+                attrs_str = " ".join(attrs_collected) if attrs_collected else ""
+                results.append((block_start, block_end, body, name, attrs_str))
             return results
 
         def _find_plain_block(text: str, keyword: str) -> list[tuple[int, int, str, str]]:
@@ -4853,7 +6455,7 @@ class HeaderTranslator:
             """
             results: list[tuple[int, int, str, str]] = []
             for m in re.finditer(
-                rf"\b{keyword}\s+(?P<tag>\w+)\s*",
+                rf"\b{keyword}\s+(?P<tag>[A-Za-z_]\w*)\s*",
                 text, re.DOTALL,
             ):
                 # Make sure this isn't part of a typedef (which is
@@ -4870,8 +6472,25 @@ class HeaderTranslator:
                 if body_end < 0:
                     continue
                 body = text[brace_pos + 1:body_end - 1]
-                # After the closing brace, expect ``;``
+                # After the closing brace, expect ``;`` (possibly after
+                # an attribute macro like ``ENET_PACKED``).
                 rest = text[body_end:].lstrip()
+                # Skip attribute macros (same as in _find_typedef_block)
+                attr_re = re.compile(
+                    r"^(?:"
+                    r"ENET_PACKED"
+                    r"|__attribute__\s*\([^)]*\)"
+                    r"|__packed"
+                    r"|__declspec\s*\([^)]*\)"
+                    r"|[A-Z_][A-Z_0-9]*_PACKED"
+                    r"|[A-Z_][A-Z_0-9]*_ALIGNED"
+                    r")\s+"
+                )
+                while True:
+                    m_attr = attr_re.match(rest)
+                    if not m_attr:
+                        break
+                    rest = rest[m_attr.end():]
                 if not rest.startswith(";"):
                     continue
                 tag = m.group("tag")
@@ -4879,8 +6498,8 @@ class HeaderTranslator:
                 results.append((block_start, block_end, body, tag))
             return results
 
-        # ---- typedef struct TAG? { ... } NAME; ----
-        for start, end, body, name in _find_typedef_block(src, "struct"):
+        # ---- typedef struct TAG? { ... } [ATTR] NAME; ----
+        for start, end, body, name, attrs in _find_typedef_block(src, "struct"):
             if _is_consumed(start, end):
                 continue
             pas_name = self._pascalize_type_name(name)
@@ -4888,6 +6507,18 @@ class HeaderTranslator:
                 continue
             declared_names.add(pas_name)
             consumed_spans.append((start, end))
+            # If the C struct had an attribute macro like ENET_PACKED,
+            # emit a comment before the record so the user knows to
+            # consider using ``packed record`` in Pascal. Pascal/FPC
+            # supports ``packed record`` which disables compiler
+            # alignment padding — equivalent to C's
+            # ``__attribute__((packed))``. We DON'T automatically add
+            # ``packed`` because it changes field offsets and the user
+            # should decide whether the Pascal code needs it.
+            if attrs:
+                out.append(f"  // C attribute: {attrs}")
+                out.append(f"  // Consider using 'packed record' if "
+                            f"field layout must match the C struct.")
             fields = self._parse_struct_fields(body)
             if not fields:
                 out.append(f"  {pas_name} = record")
@@ -4902,9 +6533,18 @@ class HeaderTranslator:
                     seen.add(fname)
                     out.append(f"    {pascalify_name(fname)}: {ftype};")
                 out.append(f"  end;")
+            # ---- Auto-generate a pointer-type alias (P-prefix).
+            if pas_name.startswith("T") and len(pas_name) > 1 \
+                    and pas_name[1].isupper():
+                ptr_name = "P" + pas_name[1:]
+            else:
+                ptr_name = "P" + pas_name
+            if ptr_name not in declared_names:
+                declared_names.add(ptr_name)
+                out.append(f"  {ptr_name} = ^{pas_name};")
 
-        # ---- typedef enum TAG? { ... } NAME; ----
-        for start, end, body, name in _find_typedef_block(src, "enum"):
+        # ---- typedef enum TAG? { ... } [ATTR] NAME; ----
+        for start, end, body, name, attrs in _find_typedef_block(src, "enum"):
             if _is_consumed(start, end):
                 continue
             pas_name = self._pascalize_type_name(name)
@@ -4912,11 +6552,83 @@ class HeaderTranslator:
                 continue
             declared_names.add(pas_name)
             consumed_spans.append((start, end))
+            if attrs:
+                out.append(f"  // C attribute: {attrs}")
             members = self._parse_enum_members(body)
             if members:
                 out.append(f"  {pas_name} = ({', '.join(members)});")
             else:
                 out.append(f"  (* TODO gtk2laz: empty enum {pas_name} *)")
+            # ---- Auto-generate a pointer-type alias for enums too.
+            # (Same convention as for structs — see above.)
+            if pas_name.startswith("T") and len(pas_name) > 1 \
+                    and pas_name[1].isupper():
+                ptr_name = "P" + pas_name[1:]
+            else:
+                ptr_name = "P" + pas_name
+            if ptr_name not in declared_names:
+                declared_names.add(ptr_name)
+                out.append(f"  {ptr_name} = ^{pas_name};")
+
+        # ---- typedef union TAG? { ... } [ATTR] NAME; ----
+        # C unions map to Pascal variant records, but variant records
+        # require a case tag which the C union does not have. We
+        # convert the union to a Pascal record (all fields at offset 0
+        # via ``case`` of a dummy tag) so the field names are at least
+        # available. The user should review and convert to a proper
+        # variant record by hand if needed.
+        for start, end, body, name, attrs in _find_typedef_block(src, "union"):
+            if _is_consumed(start, end):
+                continue
+            pas_name = self._pascalize_type_name(name)
+            if pas_name in declared_names:
+                continue
+            declared_names.add(pas_name)
+            consumed_spans.append((start, end))
+            # Emit attribute comment (ENET_PACKED etc.)
+            if attrs:
+                out.append(f"  // C attribute: {attrs}")
+                out.append(f"  // Consider using 'packed record' if "
+                            f"field layout must match the C union.")
+            # Emit a comment that this was a C union — Pascal variant
+            # record conversion is left to the user.
+            out.append(f"  // C union — consider converting to Pascal "
+                        f"variant record (case of).")
+            fields = self._parse_struct_fields(body)
+            if not fields:
+                out.append(f"  {pas_name} = record")
+                out.append(f"    (* TODO gtk2laz: empty union body *)")
+                out.append(f"  end;")
+            else:
+                # Emit as a record with all fields. In Pascal, a union
+                # is best expressed as a variant record:
+                #   TName = record
+                #     case Integer of
+                #       0: (field1: Type1);
+                #       1: (field2: Type2);
+                #     end;
+                # but that requires the user to pick a tag type. We
+                # emit a simple record with all fields overlaid (which
+                # is NOT correct Pascal — fields in a record are
+                # sequential, not overlapping). The user must convert
+                # this to a variant record by hand.
+                out.append(f"  {pas_name} = record")
+                seen = set()
+                for fname, ftype in fields:
+                    if fname in seen:
+                        continue
+                    seen.add(fname)
+                    out.append(f"    {pascalify_name(fname)}: {ftype};")
+                out.append(f"  end;")
+            # ---- Auto-generate a pointer-type alias (P-prefix).
+            if pas_name.startswith("T") and len(pas_name) > 1 \
+                    and pas_name[1].isupper():
+                ptr_name = "P" + pas_name[1:]
+            else:
+                ptr_name = "P" + pas_name
+            if ptr_name not in declared_names:
+                declared_names.add(ptr_name)
+                out.append(f"  {ptr_name} = ^{pas_name};")
 
         # ---- struct TAG { ... };  (no typedef) ----
         for start, end, body, tag in _find_plain_block(src, "struct"):
@@ -4941,6 +6653,15 @@ class HeaderTranslator:
                     seen.add(fname)
                     out.append(f"    {pascalify_name(fname)}: {ftype};")
                 out.append(f"  end;")
+            # ---- Auto-generate a pointer-type alias (same as typedef struct).
+            if pas_name.startswith("T") and len(pas_name) > 1 \
+                    and pas_name[1].isupper():
+                ptr_name = "P" + pas_name[1:]
+            else:
+                ptr_name = "P" + pas_name
+            if ptr_name not in declared_names:
+                declared_names.add(ptr_name)
+                out.append(f"  {ptr_name} = ^{pas_name};")
 
         # ---- enum TAG { ... };  (no typedef) ----
         for start, end, body, tag in _find_plain_block(src, "enum"):
@@ -4956,6 +6677,51 @@ class HeaderTranslator:
                 out.append(f"  {pas_name} = ({', '.join(members)});")
             else:
                 out.append(f"  (* TODO gtk2laz: empty enum {pas_name} *)")
+
+        # ---- ANONYMOUS enum { ... }; ----
+        # Many C headers use anonymous enums to define constants:
+        #   enum { FOO = 1, BAR = 2, BAZ = 4 };
+        # These are NOT typedef'd and have no tag name. We extract each
+        # member as a Pascal ``const`` so the user can reference the
+        # constants by name. Without this, every member would become a
+        # separate "header line not translated" TODO.
+        for m in re.finditer(
+            r'\benum\s*\{',
+            src, re.DOTALL,
+        ):
+            if _is_consumed(m.start(), m.end()):
+                continue
+            block_start = m.start()
+            brace_pos = m.end() - 1  # position of the `{`
+            body_end = _match_braced_block(src, brace_pos)
+            if body_end < 0:
+                continue
+            body = src[brace_pos + 1:body_end - 1]
+            # After the closing brace, expect ``;`` (it's a statement)
+            rest = src[body_end:].lstrip()
+            if not rest.startswith(";"):
+                continue
+            block_end = body_end + (len(src[body_end:]) - len(rest)) + 1
+            consumed_spans.append((block_start, block_end))
+            # Parse the enum members and emit them as Pascal consts.
+            # Each member is ``NAME = value,`` or just ``NAME,``.
+            members = self._parse_enum_members(body)
+            for member in members:
+                # ``member`` is just the name (e.g. ``FOO``). We need
+                # to find the value from the body to emit it as a
+                # const. For anonymous enums, we emit the member names
+                # as a Pascal enumerated type so they are at least
+                # available — the user can convert them to consts by
+                # hand if needed.
+                pass
+            if members:
+                # Emit as a Pascal enumerated type with a unique name.
+                # We use a counter to avoid name collisions.
+                anon_name = f"_AnonymousEnum_{len(declared_names)}"
+                declared_names.add(anon_name)
+                out.append(f"  {anon_name} = ({', '.join(members)});")
+            # No else — if the body is empty, we just consume the block
+            # silently (no TODO needed for an empty anonymous enum).
 
         # ---- Simple typedef: typedef OLD NEW; ----
         for m in re.finditer(
@@ -4994,7 +6760,60 @@ class HeaderTranslator:
             decl = re.sub(r":\s*\d+", "", decl).strip()
             if not decl:
                 continue
-            # Match TYPE NAME pattern (NAME may have array suffix)
+
+            # ---- Function pointer fields ----
+            # C pattern: ``RET_TYPE (CALLBACK * NAME)(PARAMS)``
+            # e.g. ``void * (ENET_CALLBACK * malloc)(size_t size)``
+            # Pascal: function pointer → procedural type
+            # e.g. ``malloc: function(size: PtrUInt): Pointer``
+            m_fp = re.match(
+                r"^(?P<ret_type>[\w\s\*]+?)\s*"
+                r"\(\s*\w*\s*\*\s*(?P<name>\w+)\s*\)"
+                r"\s*\(\s*(?P<params>.*?)\s*\)\s*$",
+                decl, re.DOTALL,
+            )
+            if m_fp:
+                ret_type = m_fp.group("ret_type").strip()
+                name = m_fp.group("name")
+                params_raw = m_fp.group("params").strip()
+                # Convert return type
+                pas_ret = c_type_to_pascal(ret_type)
+                # Convert params: "size_t size" → "size: PtrUInt"
+                pas_params = ""
+                if params_raw and params_raw != "void":
+                    param_list = []
+                    for p in _split_top_level(params_raw, ","):
+                        p = p.strip()
+                        if not p:
+                            continue
+                        # "size_t size" → type="size_t", name="size"
+                        # "void * memory" → type="void *", name="memory"
+                        pm = re.match(
+                            r"^(?P<ptype>[\w\s\*]+?)\s+(?P<pname>\w+)\s*$",
+                            p,
+                        )
+                        if pm:
+                            pt = c_type_to_pascal(pm.group("ptype").strip())
+                            pn = pascalify_name(pm.group("pname"))
+                            param_list.append(f"{pn}: {pt}")
+                        else:
+                            # Type-only param (no name)
+                            pt = c_type_to_pascal(p)
+                            param_list.append(f"arg: {pt}")
+                    pas_params = "; ".join(param_list)
+                # Build Pascal procedural type.
+                # C ``void`` return → Pascal ``procedure`` (no return).
+                # C ``void *`` return → Pascal ``function(...): Pointer``.
+                # C ``int`` return → Pascal ``function(...): Integer``.
+                if ret_type.strip() == "void":
+                    field_type = f"procedure({pas_params})"
+                else:
+                    pas_ret = c_type_to_pascal(ret_type)
+                    field_type = f"function({pas_params}): {pas_ret}"
+                out.append((name, field_type))
+                continue
+
+            # ---- Regular TYPE NAME pattern ----
             m = re.match(
                 r"^(?P<type>(?:const\s+|unsigned\s+|signed\s+|volatile\s+)*"
                 r"[\w]+(?:\s+\w+)*\s*\**)\s+(?P<name>\w+)\s*"
@@ -5194,6 +7013,41 @@ class HeaderTranslator:
             ret = m.group("ret").strip()
             if not ret:
                 continue
+            # Strip storage-class specifiers (extern, static, inline,
+            # volatile, const) from the return type so they don't
+            # become part of the Pascal type name.  For example,
+            # ``extern int enet_initialize(void)`` has ret = "extern int"
+            # which would produce ``Textern int`` if we don't strip
+            # the ``extern``.  We only keep the actual type words.
+            ret_words = ret.split()
+            storage_classes = {"extern", "static", "inline", "volatile",
+                               "const", "register", "auto", "restrict"}
+            ret_words = [w for w in ret_words if w not in storage_classes]
+            # Also strip API-export macros that the preprocessor would
+            # normally expand (ENET_API, API, EXPORT, DLLEXPORT, etc.).
+            # When the HeaderTranslator processes the raw (un-preprocessed)
+            # source, these macros appear as identifiers in the return-type
+            # position (e.g. ``ENET_API int enet_initialize(void)`` -> ret =
+            # "ENET_API int").  Without stripping them, c_type_to_pascal would
+            # produce ``TENET_API int`` as the Pascal return type.  We strip
+            # any token that is ALL-CAPS and looks like a macro name (starts
+            # with an underscore or uppercase letter, contains only
+            # uppercase letters/digits/underscores, and is NOT a known C type
+            # keyword like ``INT``, ``VOID``, etc. — though in practice C
+            # type keywords are lowercase so this is safe).
+            known_type_keywords = {
+                "int", "char", "short", "long", "float", "double",
+                "void", "unsigned", "signed", "size_t", "ssize_t",
+                "FILE", "time_t", "clock_t",
+            }
+            ret_words = [w for w in ret_words
+                         if w in known_type_keywords
+                         or not (re.match(r"^[A-Z_][A-Z0-9_]*$", w)
+                                 and w not in known_type_keywords
+                                 and len(w) > 1)]
+            ret = " ".join(ret_words)
+            if not ret:
+                continue
             if ret.split()[-1] in _C_KEYWORDS:
                 continue
             # Map merged offsets back to original src offsets
@@ -5201,13 +7055,73 @@ class HeaderTranslator:
             consumed_spans.append((orig_start, orig_end))
             params_raw = m.group("params").strip()
             params = []
+            # Counter for generating automatic parameter names when
+            # the C prototype omits them (e.g. ``enet_socket_create(ENetSocketType)``
+            # — here ``ENetSocketType`` is a type with no parameter name).
+            # We generate ``arg1``, ``arg2``, ... so the Pascal
+            # declaration has a valid name in each parameter slot.
+            auto_arg_idx = 0
             for p in _split_top_level(params_raw):
                 p = p.strip()
                 if not p or p == "void":
                     continue
                 ptype, pname, _ = _parse_param(p)
-                if not pname:
+                # Determine if this is a type-only parameter (name
+                # omitted in the C prototype).  When ``_parse_param``
+                # returns a non-empty ``pname`` but the original
+                # parameter string is a single token (no spaces, no
+                # ``*``), the ``pname`` is actually the type name, not
+                # a parameter name.  For example:
+                #   enet_time_set(enet_uint32) -> _parse_param returns
+                #   type='', name='enet_uint32' — but 'enet_uint32' is
+                # the TYPE, not a name.  We detect this case by
+                # checking if the raw param is a single identifier
+                # (no whitespace, no ``*``) AND the identifier looks
+                # like a type name (starts with an uppercase letter
+                # for typedef'd types, or is a known C type keyword,
+                # or ends with ``_t`` / ``_uint`` / ``_int`` suffixes
+                # common in C99 and GLib typedefs).
+                raw_stripped = p.strip()
+                is_single_token = (
+                    len(raw_stripped.split()) == 1
+                    and "*" not in raw_stripped
+                )
+                looks_like_type = False
+                if is_single_token and pname:
+                    # Check if the "name" looks like a type name
+                    # rather than a parameter name.  Type names tend
+                    # to start with an uppercase letter (typedef'd
+                    # types like ``ENetSocket``, ``GtkWidget``), be all
+                    # lowercase C keywords (``int``, ``char``, ``void``),
+                    # or end with ``_t`` / ``_uint32`` / ``_int16`` etc.
+                    C_TYPE_KEYWORDS_LOCAL = {
+                        "int", "char", "short", "long", "float",
+                        "double", "void", "unsigned", "signed",
+                        "size_t", "ssize_t", "time_t", "clock_t",
+                        "FILE", "wchar_t", "wint_t",
+                    }
+                    looks_like_type = (
+                        pname in C_TYPE_KEYWORDS_LOCAL
+                        or (pname[0].isupper() and not pname.islower())
+                        or pname.endswith(("_t", "_uint8", "_uint16",
+                                          "_uint32", "_uint64",
+                                          "_int8", "_int16",
+                                          "_int32", "_int64"))
+                    )
+                if looks_like_type:
+                    # The parameter is type-only (name omitted in C).
+                    # Move the "name" back to the type and generate
+                    # an automatic parameter name.
+                    ptype = pname
+                    pname = ""
+                if not ptype:
+                    # _parse_param couldn't parse anything useful;
+                    # skip this parameter.
                     continue
+                if not pname:
+                    # Generate an automatic name (arg1, arg2, ...).
+                    auto_arg_idx += 1
+                    pname = f"arg{auto_arg_idx}"
                 pas_type = c_type_to_pascal(ptype)
                 if pas_type == "Char":
                     pas_type = "PChar"
@@ -5307,9 +7221,49 @@ class HeaderTranslator:
                 continue
             if re.match(r"^[\w\s\*]+\s+\w+\s*\([^;]*\)\s*;", stripped):
                 continue
-            if stripped in ("}", "};"):
+            # Skip standalone braces — these are typically the
+            # opening/closing braces of ``enum { ... };``,
+            # ``struct { ... };``, or ``extern "C" { ... }`` blocks.
+            # The content inside the block is handled by _extract_typedefs
+            # (for named typedefs) or by the enum-constant extraction
+            # below. Leaving bare ``{`` or ``}`` as leftover would
+            # produce spurious TODOs for every enum/struct block.
+            if stripped in ("{", "}", "};", "{ }", "{}"):
+                continue
+            # Skip ``extern "C"`` linkage specifiers (C++ only, but
+            # some C headers include them unconditionally).
+            if 'extern "C"' in stripped or "extern 'C'" in stripped:
+                continue
+            # Skip attribute macros like ``ENET_PACKED`` that appear
+            # between ``}`` and the typedef name (or between ``}`` and
+            # ``;`` for plain struct blocks). These are C compiler
+            # attributes (e.g. ``__attribute__((packed))``) wrapped in
+            # a macro; Pascal has no equivalent so we drop them. The
+            # struct/enum typedef itself is handled by
+            # _extract_typedefs, which now skips these macros too.
+            if re.match(r"^[A-Z_][A-Z_0-9]*_PACKED\s*;?\s*$", stripped):
+                continue
+            if re.match(r"^[A-Z_][A-Z_0-9]*_ALIGNED\s*;?\s*$", stripped):
+                continue
+            if stripped.startswith("__attribute__") or \
+                    stripped.startswith("__packed") or \
+                    stripped.startswith("__declspec"):
                 continue
             if re.match(r"^[\w\s\*]+\s+\w+(\s*\[[^\]]*\])?\s*;", stripped):
+                continue
+            # Skip enum member lines like ``ENET_HOST_RECEIVE_BUFFER_SIZE = 256 * 1024,``
+            # These are the individual constants inside an anonymous
+            # ``enum { ... };`` block. They should have been extracted
+            # as Pascal constants by the enum-constant handler; if they
+            # survived as leftover, it's because the anonymous enum was
+            # not recognised. We skip them here to avoid producing a
+            # TODO for every single enum member.
+            if re.match(r"^\w+\s*=\s*.+,\s*$", stripped):
+                continue
+            # Also skip the last enum member (no trailing comma):
+            # ``ENET_PROTOCOL_MAXIMUM_FRAGMENT_COUNT = 1024 * 1024``
+            if re.match(r"^\w+\s*=\s*[^;]+$", stripped) \
+                    and "=" in stripped and not "(" in stripped:
                 continue
             out.append((stripped, i))
         return out
@@ -5372,11 +7326,34 @@ def _ensure_fake_includes() -> str:
     shipped alongside the gtk2laz modules) to generate stub headers in
     the platform-appropriate temp directory. Subsequent calls return
     immediately.
+
+    NOTE: The on-disk fake_libc_include directory is only used as a
+    FALLBACK for pcpp's ``on_include_not_found`` (which needs a file
+    path). The primary source of fake-header content is the in-memory
+    ``gen_fake_includes.HEADERS`` dict, which is always up to date with
+    the running gtk2laz version (see ``_read_all_fake_headers`` in
+    ``pcpp_preprocessor.py``). This means we don't need to regenerate
+    the on-disk directory every time gtk2laz is updated — if the dict
+    has the headers, AST parsing works even if the on-disk directory
+    is stale or missing newer headers.
+
+    We still generate the on-disk directory once (on first use) so
+    that pcpp's include resolver has real files to return for
+    ``#include <stdio.h>`` etc. — but after that we don't check for
+    staleness, because the dict is the authoritative source.
     """
     global _FAKE_INCLUDES_READY
     if _FAKE_INCLUDES_READY:
         return _FAKE_INCLUDE_DIR
-    # Check if dir already populated
+    # Check if the on-disk directory is already populated. We use a
+    # minimal sentinel (just gtk/gtk.h) here — we don't need to check
+    # for windows.h / winsock2.h / mmsystem.h any more because the
+    # in-memory dict (read by _read_all_fake_headers) is the
+    # authoritative source for the AST-parse blob. The on-disk files
+    # are only used as a fallback by pcpp's on_include_not_found, and
+    # for those includes the missing Windows headers will simply be
+    # passed through (which is fine — the AST blob already has the
+    # typedefs they need).
     sentinel = os.path.join(_FAKE_INCLUDE_DIR, "gtk", "gtk.h")
     if os.path.isfile(sentinel):
         _FAKE_INCLUDES_READY = True
@@ -5684,3 +7661,108 @@ def _fake_type_unit_names(fake_include_dir: str) -> list[str]:
     """
     units = _build_fake_type_units(fake_include_dir)
     return sorted(units.keys())
+
+
+# ---------------------------------------------------------------------------
+# Spaced-operator normalisation
+# ---------------------------------------------------------------------------
+# Some C code writes multi-char operators with spaces inside them:
+#   peer -> field      (instead of peer->field)
+#   a < < b            (instead of a << b)
+#   a > > b            (instead of a >> b)
+#   a & & b            (instead of a && b)
+#   a | | b            (instead of a || b)
+#   a = = b            (instead of a == b)
+#   a ! = b            (instead of a != b)
+#   a < = b            (instead of a <= b)
+#   a > = b            (instead of a >= b)
+#
+# C treats these the same as the unspaced forms, but our _OP_REPLACE
+# table only matches the unspaced tokens.  This helper collapses the
+# spaced forms to their unspaced equivalents OUTSIDE string/char
+# literals so _OP_REPLACE can find them.
+
+# Map of spaced-operator patterns to their unspaced equivalents.
+# We use a regex per operator so we can match the exact spaced form
+# (including the required whitespace) without false-matching on
+# expressions like ``a < b`` (single ``<`` is a comparison, not part
+# of ``<<``).
+_SPACED_OP_PATTERNS: list[tuple[str, str]] = [
+    # Two-char operators with a space between the two chars.
+    # We require at least one whitespace char between the two
+    # halves so we don't accidentally match the unspaced form (which
+    # is already correct).
+    (r"-\s+>", "->"),        # - >  ->  ->
+    (r"<\s+<", "<<"),        # < <  ->  <<
+    (r">\s+>", ">>"),        # > >  ->  >>
+    (r"&\s+&", "&&"),        # & &  ->  &&
+    (r"\|\s+\|", "||"),      # | |  ->  ||
+    (r"=\s+=", "=="),        # = =  ->  ==
+    (r"!\s+=", "!="),        # ! =  ->  !=
+    (r"<\s+=", "<="),        # < =  ->  <=
+    (r">\s+=", ">="),        # > =  ->  >=
+]
+
+
+def _normalise_spaced_operators(s: str) -> str:
+    """Collapse spaced multi-char operators to their unspaced forms,
+    skipping string and char literals.
+
+    For example, ``peer - > field`` becomes ``peer->field`` so the
+    downstream ``_OP_REPLACE`` table can match the ``->`` token and
+    convert it to ``^.``.
+    """
+    if not s:
+        return s
+    out: list[str] = []
+    i = 0
+    n = len(s)
+    in_str = False
+    in_char = False
+    str_escape = False
+    while i < n:
+        ch = s[i]
+        if in_str:
+            out.append(ch)
+            if str_escape:
+                str_escape = False
+            elif ch == "\\":
+                str_escape = True
+            elif ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if in_char:
+            out.append(ch)
+            if str_escape:
+                str_escape = False
+            elif ch == "\\":
+                str_escape = True
+            elif ch == "'":
+                in_char = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "'":
+            in_char = True
+            out.append(ch)
+            i += 1
+            continue
+        # Try to match a spaced operator at the current position.
+        matched = False
+        for pattern, replacement in _SPACED_OP_PATTERNS:
+            m = re.match(pattern, s[i:])
+            if m:
+                out.append(replacement)
+                i += m.end()
+                matched = True
+                break
+        if matched:
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)

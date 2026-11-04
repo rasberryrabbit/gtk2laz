@@ -40,8 +40,104 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
-# Make sibling modules importable when run as a script
+# ---------------------------------------------------------------------------
+# Version and build timestamp
+# ---------------------------------------------------------------------------
+# The build timestamp is written by ``build_win_exe.bat`` /
+# ``build_exe.sh`` into ``_build_timestamp.txt`` next to gtk2laz.py at
+# build time. We read it at import time so every run of the converter
+# (CLI or GUI) knows exactly which source version it was built from.
+# This is critical for diagnosing "the user is running an old build"
+# situations: the timestamp appears at the top of ``conversion.log``
+# and in the GUI title bar, so the user can tell at a glance whether
+# they have the latest fixes.
+VERSION = "1.2"
+
+# Directory containing this file. Used to locate the source modules
+# and to add them to ``sys.path``. Computed early so the
+# source-timestamp reader below can use it.
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _read_source_timestamp() -> str:
+    """Compute the timestamp of the source code.
+
+    Scans every ``.py`` file in the same directory as ``gtk2laz.py``
+    and returns the NEWEST (most recently modified) file's mtime,
+    formatted as a human-readable UTC string. This lets the user tell
+    at a glance which version of the source they are running — even
+    without a build step.
+
+    Why the newest of all .py files (not just gtk2laz.py):
+    A typical gtk2laz update touches ``pcpp_preprocessor.py`` or
+    ``c_parser.py`` but leaves ``gtk2laz.py`` unchanged. If we only
+    looked at gtk2laz.py's mtime, the timestamp would not reflect
+    the update. By scanning all .py files, the timestamp always
+    reflects the latest modification across the entire source tree.
+
+    We also include the ``ply/`` subdirectory so changes to the
+    bundled ply package are reflected too.
+
+    Returns a string like ``"source:2026-11-04 02:07:19 UTC"``.
+    The ``source:`` prefix distinguishes this from a build timestamp
+    (which would be written by ``build_win_exe.bat`` / ``build_exe.sh``
+    into ``_build_timestamp.txt`` — but we no longer use that file;
+    the source mtime is always accurate and requires no build step).
+    """
+    import datetime as _dt
+    newest_mtime = 0.0
+    try:
+        # Scan all .py files in the same directory as gtk2laz.py
+        for fname in os.listdir(HERE):
+            if not fname.endswith(".py"):
+                continue
+            fpath = os.path.join(HERE, fname)
+            try:
+                m = os.path.getmtime(fpath)
+                if m > newest_mtime:
+                    newest_mtime = m
+            except OSError:
+                continue
+        # Also scan the ply/ subdirectory if it exists
+        ply_dir = os.path.join(HERE, "ply")
+        if os.path.isdir(ply_dir):
+            for fname in os.listdir(ply_dir):
+                if not fname.endswith(".py"):
+                    continue
+                fpath = os.path.join(ply_dir, fname)
+                try:
+                    m = os.path.getmtime(fpath)
+                    if m > newest_mtime:
+                        newest_mtime = m
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    if newest_mtime <= 0:
+        return "unknown"
+    dt = _dt.datetime.fromtimestamp(newest_mtime, tz=_dt.timezone.utc)
+    return f"source:{dt.strftime('%Y-%m-%d %H:%M:%S UTC')}"
+
+
+BUILD_TIMESTAMP = _read_source_timestamp()
+
+
+def get_version_string() -> str:
+    """Return a full version string suitable for display.
+
+    Format: ``"gtk2laz 1.2 (source:2026-11-04 02:07:19 UTC)"``
+
+    The ``source:`` prefix and UTC timestamp tell the user exactly
+    which version of the source code they are running. This is more
+    useful than a build timestamp because it works even without a
+    build step (e.g. running ``python gtk2laz.py`` directly from a
+    clone), and it always reflects the latest modification across
+    ALL source files — not just gtk2laz.py.
+    """
+    return f"gtk2laz {VERSION} ({BUILD_TIMESTAMP})"
+
+
+# Make sibling modules importable when run as a script
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
@@ -98,6 +194,131 @@ def _order_headers(h_files: list[str],
 
 
 # ---------------------------------------------------------------------------
+# Conversion-log capture (CLI mode)
+# ---------------------------------------------------------------------------
+def _begin_log_capture(out_dir: str) -> str:
+    """Begin capturing stderr to ``<out_dir>/conversion.log`` in addition
+    to the user's console.
+
+    Returns the path to the log file (which is created immediately so the
+    directory exists). When the caller is done, it must call
+    ``_end_log_capture(log_path)`` to restore stderr and close the file.
+
+    Why we capture stderr (not stdout): all the gtk2laz diagnostic
+    messages (``gtk2laz: AST parse failed for ...``, ``[info] ...``,
+    traceback dumps, etc.) are printed to stderr. By teeing stderr to a
+    file we get a full transcript of what happened during the conversion,
+    which the user can review or share for troubleshooting — without
+    having to scroll back through a long console window.
+    """
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        pass
+    log_path = os.path.join(out_dir, "conversion.log")
+    # Open the log file and write a header so it is self-documenting.
+    # We keep the file handle in a module-global so ``_end_log_capture``
+    # can close it without the caller having to pass it back in.
+    import datetime as _dt
+    global _LOG_FILE, _OLD_STDERR
+    try:
+        _LOG_FILE = open(log_path, "w", encoding="utf-8")
+        _LOG_FILE.write(
+            f"gtk2laz conversion log\n"
+            f"Version: {get_version_string()}\n"
+            f"Date: {_dt.datetime.now().isoformat(timespec='seconds')}\n"
+            f"Output directory: {out_dir}\n"
+            f"{'=' * 60}\n"
+        )
+        _LOG_FILE.flush()
+    except Exception:
+        _LOG_FILE = None
+        return log_path
+    # Replace sys.stderr with a tee that writes to both the original
+    # stderr and the log file. We use a small wrapper class for this so
+    # the file gets every line as it is printed (not just on flush).
+    _OLD_STDERR = sys.stderr
+
+    class _TeeStderr:
+        def __init__(self, original, log_file):
+            self._orig = original
+            self._log = log_file
+
+        def write(self, s):
+            try:
+                self._orig.write(s)
+            except Exception:
+                pass
+            try:
+                self._log.write(s)
+                # Flush after every write so a crash mid-conversion
+                # still leaves a complete log on disk.
+                self._log.flush()
+            except Exception:
+                pass
+            return len(s) if s else 0
+
+        def flush(self):
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+            try:
+                self._log.flush()
+            except Exception:
+                pass
+
+        # Some libraries check .isatty() to decide whether to use
+        # colour codes etc. Forward to the real stderr so behaviour
+        # matches the user's terminal.
+        def isatty(self):
+            try:
+                return self._orig.isatty()
+            except Exception:
+                return False
+
+        def fileno(self):
+            return self._orig.fileno()
+
+        def __getattr__(self, name):
+            return getattr(self._orig, name)
+
+    sys.stderr = _TeeStderr(_OLD_STDERR, _LOG_FILE)
+    return log_path
+
+
+def _end_log_capture(log_path: str) -> None:
+    """Stop capturing stderr and close the log file.
+
+    Restores the original ``sys.stderr`` and writes a final footer to
+    the log file (with a note that this is the end of the conversion
+    output) so the user can tell at a glance whether the log was
+    truncated by a crash or contains the full run.
+    """
+    global _LOG_FILE, _OLD_STDERR
+    # Restore original stderr FIRST so any error message we print
+    # while closing the file goes to the real terminal.
+    if "_OLD_STDERR" in globals() and _OLD_STDERR is not None:
+        sys.stderr = _OLD_STDERR
+        _OLD_STDERR = None
+    if "_LOG_FILE" in globals() and _LOG_FILE is not None:
+        try:
+            _LOG_FILE.write(f"\n{'=' * 60}\nEnd of conversion log\n")
+            _LOG_FILE.close()
+        except Exception:
+            pass
+        _LOG_FILE = None
+
+
+# Module-level state for the log-capture helpers above. We use globals
+# because the helpers are called from the top-level CLI dispatcher and
+# need to share the file handle / original stderr between begin() and
+# end() without forcing the caller to thread the state through.
+_LOG_FILE = None
+_OLD_STDERR = None
+
+
+# ---------------------------------------------------------------------------
 # Header-aware C file conversion
 # ---------------------------------------------------------------------------
 def convert_c_file_with_includes(c_path: str, out_dir: str,
@@ -106,7 +327,8 @@ def convert_c_file_with_includes(c_path: str, out_dir: str,
                                   included_units: list[str],
                                   header_types: list[str] = None,
                                   header_defines: list = None,
-                                  header_externs: list = None) -> dict:
+                                  header_externs: list = None,
+                                  target_platform: str = "auto") -> dict:
     """Convert a .c file and add the given header-derived unit names to
     the generated unit's ``uses`` clause.
 
@@ -119,6 +341,9 @@ def convert_c_file_with_includes(c_path: str, out_dir: str,
     This is now a thin wrapper around ``c_parser.convert_c_file`` which
     itself accepts ``included_units`` directly (and also tries the
     pycparser-based AST translator for accurate signatures).
+
+    ``target_platform`` is forwarded to ``convert_c_file`` so that the
+    correct platform preset macros are defined during preprocessing.
     """
     return convert_c_file(c_path, out_dir,
                            unit_name=unit_name,
@@ -126,7 +351,8 @@ def convert_c_file_with_includes(c_path: str, out_dir: str,
                            included_units=included_units,
                            header_types=header_types,
                            header_defines=header_defines,
-                           header_externs=header_externs)
+                           header_externs=header_externs,
+                           target_platform=target_platform)
 
 
 def discover(root: str) -> Project:
@@ -141,6 +367,11 @@ def discover(root: str) -> Project:
             if ext == ".glade":
                 glade.append(full)
             elif ext == ".c":
+                # Skip our own temporary expanded-source files (they
+                # live next to the real sources while a conversion is
+                # running and must never be converted themselves).
+                if f.startswith("gtk2laz_expanded_"):
+                    continue
                 c.append(full)
             elif ext == ".h":
                 h.append(full)
@@ -290,7 +521,9 @@ def convert(input_dir: str, output_dir: str,
             glade_name: Optional[str] = None,
             report_path: Optional[str] = None,
             c_only: bool = False,
-            progress_callback=None) -> dict:
+            progress_callback=None,
+            target_platform: str = "auto",
+            extra_defines: Optional[list[str]] = None) -> dict:
     """Convert a GTK source tree into a Lazarus project.
 
     When ``c_only`` is True, the Glade form is skipped and only the C
@@ -301,6 +534,19 @@ def convert(input_dir: str, output_dir: str,
     ``progress_callback(message: str)`` at various stages of the
     conversion (e.g. "Converting coff.h…"). The GUI uses this to
     display the currently-processed file.
+
+    ``target_platform`` selects which platform's preset macros
+    (``_WIN32``, ``__linux__``, ``__APPLE__`` etc.) are defined in
+    pcpp before preprocessing each .c/.h file. This controls which
+    branch of every ``#ifdef`` guard is taken. ``"auto"`` uses the
+    running interpreter's platform; the user can override by passing
+    ``--platform=windows`` / ``linux`` / ``macos`` on the CLI.
+
+    ``extra_defines`` is an optional list of additional macro
+    definitions the user passed via ``--define`` on the CLI. Each
+    entry is a string like ``"NAME=value"`` or ``"NAME"`` (which
+    defines NAME to 1). These are passed straight through to pcpp
+    on top of the platform preset.
     """
 
     def _progress(msg: str) -> None:
@@ -310,9 +556,37 @@ def convert(input_dir: str, output_dir: str,
             except Exception:
                 pass  # don't let callback errors break conversion
 
+    # Set the module-level extra defines so every subsequent
+    # ``preprocess()`` call (one per .c/.h file) picks them up. We do
+    # this ONCE here at the start of the conversion so we don't have
+    # to thread the list through every function in the call chain.
+    try:
+        from pcpp_preprocessor import set_extra_defines
+        set_extra_defines(extra_defines)
+    except Exception:
+        pass
+
     proj = discover(input_dir)
     proj.output_dir = output_dir
     os.makedirs(output_dir, exist_ok=True)
+
+    # ---- Auto-fall-back to C-only mode when there are no .glade files.
+    #
+    # The user might invoke ``gtk2laz convert <src> <out>`` on a C
+    # source tree that has no .glade file (e.g. enet, opgui_src, or any
+    # pure C library). Previously this raised ``SystemExit("No .glade
+    # file found...")`` and the user had to re-run with the ``c2pas``
+    # subcommand (or the ``--c-only`` flag) instead. To make the tool
+    # Just Work, we silently switch to C-only mode when no .glade file
+    # is present — this matches the user's mental model: ``convert``
+    # does whatever the input tree needs. Users who explicitly want
+    # Glade processing can still force it by passing a ``--glade``
+    # argument (which would then fail loudly if the named file does
+    # not exist, as before).
+    if not c_only and not proj.glade_files and not glade_name:
+        c_only = True
+        _progress("No .glade file found in input — using C-only mode "
+                  "(same as `c2pas`).")
 
     glade_result = None
     if not c_only:
@@ -455,6 +729,7 @@ def convert(input_dir: str, output_dir: str,
             header_types=h_types,
             header_defines=h_defines,
             header_externs=h_externs,
+            target_platform=target_platform,
         )
         c_results.append(result)
         unit_names.append(result["unit_name"])
@@ -501,6 +776,15 @@ def convert(input_dir: str, output_dir: str,
         _json.dump([_todo_to_dict(t) for t in all_todos], f,
                     indent=2, ensure_ascii=False)
 
+    # Also write a human-readable TODO list as a Markdown file. The
+    # JSON file (todos.json) is for machine consumption (the GUI's
+    # TODO tree, the ``list-todos`` subcommand); this Markdown file is
+    # for the USER — they can open it in any text editor, read through
+    # every TODO, click through to the source line, and check items
+    # off as they fix them. Each TODO is grouped by its output .pas
+    # unit so the user can work through one unit at a time.
+    _write_todo_markdown(output_dir, all_todos)
+
     return {
         "project_name": project_name,
         "output_dir": output_dir,
@@ -514,6 +798,106 @@ def convert(input_dir: str, output_dir: str,
         "todos": all_todos,
         "c_only": c_only,
     }
+
+
+# ---------------------------------------------------------------------------
+# TODO markers file writer
+# ---------------------------------------------------------------------------
+def _write_todo_markdown(output_dir: str, todos: list[dict]) -> None:
+    """Write a human-readable ``TODO_MARKERS.md`` file to the output
+    directory.
+
+    The file lists every TODO marker the converter produced, grouped
+    by the output ``.pas`` unit. For each TODO it shows:
+      - the source file and line (so the user can jump to the original
+        C code in their editor)
+      - the output file and line (so the user can jump to the Pascal
+        code that needs fixing)
+      - the reason (e.g. "unrecognised statement", "empty struct body")
+      - the original C snippet (truncated to keep lines readable)
+      - the enclosing function name (if known)
+
+    The file is Markdown so it renders nicely in GitHub / GitLab /
+    VS Code preview, but it is also perfectly readable as plain text
+    in any editor (``notepad``, ``vim``, ``cat``, etc.).
+
+    The file is OVERWRITTEN on each conversion so it always reflects
+    the most recent run.
+    """
+    if not todos:
+        # No TODOs at all — still write the file (with a "no TODOs"
+        # message) so the user knows the conversion completed
+        # successfully and there is nothing to fix.
+        md_path = os.path.join(output_dir, "TODO_MARKERS.md")
+        try:
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write("# TODO Markers\n\n")
+                f.write(f"Generated by {get_version_string()}\n\n")
+                f.write("No TODO markers were produced during this "
+                         "conversion. All C statements were translated "
+                         "successfully.\n")
+        except OSError:
+            pass
+        return
+
+    # Group TODOs by output file (the .pas unit they appear in).
+    # This lets the user work through one unit at a time.
+    by_unit: dict[str, list[dict]] = {}
+    for t in todos:
+        unit = t.get("output_file", "") or "(unknown unit)"
+        # Use just the basename so the grouping is clean even if the
+        # path is absolute or relative.
+        unit_base = os.path.basename(unit)
+        by_unit.setdefault(unit_base, []).append(t)
+
+    md_path = os.path.join(output_dir, "TODO_MARKERS.md")
+    try:
+        with open(md_path, "w", encoding="utf-8") as f:
+            f.write("# TODO Markers\n\n")
+            f.write(f"Generated by {get_version_string()}\n\n")
+            f.write(f"Total TODOs: **{len(todos)}** in "
+                    f"**{len(by_unit)}** unit(s)\n\n")
+            f.write("---\n\n")
+            # Table of contents — one entry per unit
+            f.write("## Units with TODOs\n\n")
+            for unit in sorted(by_unit.keys()):
+                count = len(by_unit[unit])
+                # Anchor link (Markdown auto-generates anchors from
+                # headings; we just lowercase and replace spaces).
+                anchor = unit.lower().replace(" ", "-")
+                f.write(f"- [{unit}](#{anchor}) — {count} TODO(s)\n")
+            f.write("\n---\n\n")
+            # Detailed listing per unit
+            for unit in sorted(by_unit.keys()):
+                f.write(f"## {unit}\n\n")
+                unit_todos = by_unit[unit]
+                # Sort by source line so the user can read top-to-bottom
+                unit_todos.sort(key=lambda t: (t.get("source_line", 0),
+                                                t.get("output_line", 0)))
+                for i, t in enumerate(unit_todos, 1):
+                    src_file = t.get("source_file", "?")
+                    src_line = t.get("source_line", 0)
+                    out_line = t.get("output_line", 0)
+                    reason = t.get("reason", "")
+                    func = t.get("function", "")
+                    snippet = t.get("source_text", "")
+                    # Truncate snippet to keep the file readable
+                    if len(snippet) > 120:
+                        snippet = snippet[:117] + "..."
+                    # Replace newlines in snippet so it fits on one line
+                    snippet = snippet.replace("\n", " ").replace("\r", "")
+                    f.write(f"### {i}. {reason}")
+                    if func:
+                        f.write(f" (in `{func}()`)")
+                    f.write("\n\n")
+                    f.write(f"- **Source**: `{src_file}`:{src_line}\n")
+                    if out_line:
+                        f.write(f"- **Output**: `{unit}`:{out_line}\n")
+                    if snippet:
+                        f.write(f"- **C snippet**: `{snippet}`\n")
+                    f.write("\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -687,6 +1071,32 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--report", default=None,
                    help="Path to write the conversion report "
                         "(default: <output_dir>/CONVERSION_REPORT.md)")
+    # Target platform for #ifdef branch selection. This is the
+    # single most important knob for cross-platform C libraries: it
+    # decides which branch of ``#ifdef _WIN32`` / ``#ifdef __linux__``
+    # / ``#ifdef __APPLE__`` is taken in every header. ``auto`` (the
+    # default) mirrors the running interpreter's platform — so on a
+    # Linux build host the default is ``linux``; on a Windows build
+    # host it is ``windows``. The user can override to convert code
+    # for a different target platform (e.g. ``--platform=windows`` on
+    # a Linux host to convert Windows-only source code like enet's
+    # win32.c).
+    p.add_argument("--platform", default="auto",
+                   choices=["auto", "windows", "linux", "macos"],
+                   help="Target platform for #ifdef branch selection "
+                        "(default: auto = host platform)")
+    # Extra --define options, like gcc's -D. The user can pass any
+    # number of these; each one is forwarded to pcpp on top of the
+    # platform preset. This is the escape hatch for unusual #ifdef
+    # guards that are not covered by the platform preset (e.g.
+    # ``--define HAVE_EPOLL=1`` to enable a Linux-specific code path
+    # that is gated by ``#ifdef HAVE_EPOLL``).
+    # Format: ``NAME`` (defines to 1), ``NAME=value`` (defines to
+    # value), or ``NAME=`` (defines to empty).
+    p.add_argument("--define", action="append", default=[],
+                   metavar="NAME[=VALUE]",
+                   help="Pre-define a macro before preprocessing "
+                        "(repeatable; like gcc's -D)")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -696,7 +1106,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     "Lazarus LCL project.",
     )
     parser.add_argument("--version", action="version",
-                        version="gtk2laz 1.1")
+                        version=get_version_string())
     sub = parser.add_subparsers(dest="command", metavar="<command>")
 
     # convert: full GTK -> Lazarus conversion
@@ -719,6 +1129,16 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="Optional form unit name to add to uses clauses")
     p_c2p.add_argument("--report", default=None,
                         help="Path to write the conversion report")
+    # c2pas also accepts --platform and --define so the user can
+    # cross-convert the same way as with ``convert``.
+    p_c2p.add_argument("--platform", default="auto",
+                       choices=["auto", "windows", "linux", "macos"],
+                       help="Target platform for #ifdef branch selection "
+                            "(default: auto = host platform)")
+    p_c2p.add_argument("--define", action="append", default=[],
+                       metavar="NAME[=VALUE]",
+                       help="Pre-define a macro before preprocessing "
+                            "(repeatable; like gcc's -D)")
 
     # gui: launch the interactive GUI
     p_gui = sub.add_parser("gui",
@@ -741,6 +1161,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         raw_argv = ["convert"] + raw_argv
 
     args = parser.parse_args(raw_argv)
+
+    # Print the version + build timestamp at the very start of every
+    # CLI run (except --version which already printed it via argparse).
+    # This goes to stderr so it appears in the console and is captured
+    # into conversion.log by _begin_log_capture(). The user can then
+    # tell at a glance which build they are running.
+    if args.command in ("c2pas", "convert"):
+        print(get_version_string(), file=sys.stderr)
 
     # ---- Subcommand: gui ----
     if args.command == "gui":
@@ -769,11 +1197,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not args.output_dir:
             print("error: output_dir is required", file=sys.stderr)
             return 2
-        result = convert(args.input_dir, args.output_dir,
-                         form_unit=args.form_unit or "mainform",
-                         form_class="TMainForm",
-                         report_path=args.report,
-                         c_only=True)
+        # Tee stderr into a conversion.log file in the output directory
+        # so the user has a persistent record of every diagnostic message
+        # (AST parse failures, pcpp errors, etc.). The on-screen output
+        # is still printed as usual; this just adds a file copy.
+        _log_path = _begin_log_capture(args.output_dir)
+        try:
+            result = convert(args.input_dir, args.output_dir,
+                             form_unit=args.form_unit or "mainform",
+                             form_class="TMainForm",
+                             report_path=args.report,
+                             c_only=True,
+                             target_platform=getattr(args, "platform", "auto"),
+                             extra_defines=getattr(args, "define", None))
+        finally:
+            _end_log_capture(_log_path)
+            print(f"  Log:    {_log_path}")
         print(f"C -> Pascal conversion complete: {result['output_dir']}")
         print(f"  Units:  {len(result['units'])}")
         print(f"  TODOs:  {len(result['todos'])}")
@@ -789,16 +1228,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         if not args.output_dir:
             print("error: output_dir is required", file=sys.stderr)
             return 2
-        c_only = getattr(args, "c_only", False)
-        result = convert(args.input_dir, args.output_dir,
-                         form_unit=args.form_unit,
-                         form_class=args.form_class,
-                         glade_name=args.glade,
-                         report_path=args.report,
-                         c_only=c_only)
+        c_only_arg = getattr(args, "c_only", False)
+        # Same log capture as c2pas: write ``conversion.log`` to the
+        # output directory so the user has a persistent record of all
+        # diagnostic messages even after the console window is closed.
+        _log_path = _begin_log_capture(args.output_dir)
+        try:
+            result = convert(args.input_dir, args.output_dir,
+                             form_unit=args.form_unit,
+                             form_class=args.form_class,
+                             glade_name=args.glade,
+                             report_path=args.report,
+                             c_only=c_only_arg,
+                             target_platform=getattr(args, "platform", "auto"),
+                             extra_defines=getattr(args, "define", None))
+        finally:
+            _end_log_capture(_log_path)
+            print(f"  Log:    {_log_path}")
+        # Use the c_only flag from the result dict, NOT the argument:
+        # ``convert()`` may have auto-switched to C-only mode when no
+        # .glade file was found in the input directory. In that case we
+        # must NOT print the "Form:" line, because no Glade form was
+        # processed.
+        effective_c_only = result.get("c_only", c_only_arg)
         print(f"Converted {result['project_name']} -> {result['output_dir']}")
-        if not c_only:
+        if not effective_c_only:
             print(f"  Form:   {result['form_unit']} ({result['form_class']})")
+        else:
+            print(f"  Mode:   C -> Pascal (no .glade file)")
         print(f"  Units:  {len(result['units'])}")
         print(f"  TODOs:  {len(result['todos'])}")
         print(f"  Report: {result['report_path']}")
