@@ -2107,6 +2107,29 @@ class AstBodyTranslator:
         expr = self._translate_expr(node)
         self._emit(f"{pad}{expr};")
 
+    def _stmt_Typedef(self, node) -> None:
+        """Local typedef inside a function body.
+
+        C allows typedef inside function bodies (local typedefs). In
+        Pascal there's no exact equivalent, so we emit them as comments
+        so the user can add them by hand if needed. This matches the
+        pattern-based translator's behaviour.
+        """
+        pad = self._pad()
+        # Extract the typedef name (node.name holds it)
+        name = getattr(node, 'name', '') or ''
+        if name:
+            # Also record it so subsequent variable declarations using
+            # this local typedef can be recognised by other AST
+            # handlers (e.g. _stmt_Decl).
+            if not hasattr(self, '_local_typedef_names'):
+                self._local_typedef_names = set()
+            self._local_typedef_names.add(name)
+            self._emit(f"{pad}// local typedef: {name}")
+        else:
+            # Fall back to a generic comment with the node type
+            self._emit(f"{pad}// local typedef (unrecognised form)")
+
     def _stmt_Pragma(self, node) -> None:
         pass  # ignore pragmas
 

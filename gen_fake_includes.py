@@ -496,6 +496,10 @@ typedef unsigned short WORD;
 typedef unsigned char  BYTE;
 typedef int            BOOL;
 typedef void *         HANDLE;
+typedef HANDLE         HMODULE;
+typedef HANDLE         HINSTANCE;
+typedef HANDLE         HDC;
+typedef HANDLE         HWND;
 typedef void *         PVOID;
 typedef void *         LPVOID;
 typedef char *         LPSTR;
@@ -513,15 +517,89 @@ typedef unsigned long  u_long;
 typedef unsigned short u_short;
 typedef unsigned int   u_int;
 typedef unsigned char  u_char;
+typedef long long      LARGE_INTEGER;
+typedef long long      ULARGE_INTEGER;
+typedef int            BOOLEAN;
+typedef unsigned long  *PULONG;
+typedef unsigned long  *PDWORD;
+typedef unsigned short *PWORD;
+typedef unsigned char  *PBYTE;
+typedef long           *PLONG;
+typedef short          *PSHORT;
+typedef int            *PINT;
+typedef unsigned int   *PUINT;
+typedef struct _GUID { unsigned long Data1; unsigned short Data2; unsigned short Data3; unsigned char Data4[8]; } GUID, *LPGUID, *REFGUID;
+typedef const GUID   *LPCGUID;
+typedef struct _OVERLAPPED { DWORD Internal; DWORD InternalHigh; } OVERLAPPED, *LPOVERLAPPED;
+typedef struct _SECURITY_ATTRIBUTES { DWORD nLength; void *lpSecurityDescriptor; BOOL bInheritHandle; } LPSECURITY_ATTRIBUTES, *PSECURITY_ATTRIBUTES;
+typedef long long       __int64;
+typedef long            __int32;
+typedef short           __int16;
+typedef char            __int8;
+typedef unsigned long long  __uint64;
+typedef unsigned long       __uint32;
+typedef unsigned short     __uint16;
+typedef unsigned char      __uint8;
+typedef struct _HDEVINFO { DWORD unused; } HDEVINFO, *PHDEVINFO;
+typedef struct _SP_DEVICE_INTERFACE_DATA { DWORD cbSize; GUID InterfaceClassGuid; DWORD Flags; ULONG Reserved; } SP_DEVICE_INTERFACE_DATA, *PSP_DEVICE_INTERFACE_DATA;
+typedef struct _SP_DEVINFO_DATA { DWORD cbSize; GUID ClassGuid; DWORD DevInst; ULONG Reserved; } SP_DEVINFO_DATA, *PSP_DEVINFO_DATA;
+typedef struct _SP_DEVICE_INTERFACE_DETAIL_DATA_A { DWORD cbSize; char DevicePath[1]; } SP_DEVICE_INTERFACE_DETAIL_DATA_A, *PSP_DEVICE_INTERFACE_DETAIL_DATA_A;
+typedef SP_DEVICE_INTERFACE_DETAIL_DATA_A SP_DEVICE_INTERFACE_DETAIL_DATA;
+typedef PSP_DEVICE_INTERFACE_DETAIL_DATA_A PSP_DEVICE_INTERFACE_DETAIL_DATA;
+typedef struct _HIDD_ATTRIBUTES { ULONG Size; USHORT VendorID; USHORT ProductID; USHORT VersionNumber; } HIDD_ATTRIBUTES, *PHIDD_ATTRIBUTES;
 #define WINAPI
 #define STDCALL
 #define CALLBACK
 #define __stdcall
 #define __cdecl
+#define IN
+#define OUT
+#define OPTIONAL
+#define CONST const
 #define LOBYTE(w)  ((BYTE)(w))
 #define HIBYTE(w)  ((BYTE)(((WORD)(w) >> 8) & 0xFF))
 #define LOWORD(w)  ((WORD)(w))
 #define HIWORD(w)  ((WORD)(((DWORD)(w) >> 16) & 0xFFFF))
+extern BOOL QueryPerformanceCounter(LARGE_INTEGER *);
+extern BOOL QueryPerformanceFrequency(LARGE_INTEGER *);
+extern DWORD GetLastError(void);
+extern HANDLE CreateFile(const char *, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+extern BOOL ReadFile(HANDLE, void *, DWORD, DWORD *, LPOVERLAPPED);
+extern BOOL WriteFile(HANDLE, const void *, DWORD, DWORD *, LPOVERLAPPED);
+extern BOOL CloseHandle(HANDLE);
+extern HANDLE CreateEvent(LPSECURITY_ATTRIBUTES, BOOL, BOOL, const char *);
+extern void Sleep(DWORD);
+extern HMODULE LoadLibrary(const char *);
+extern void *GetProcAddress(HMODULE, const char *);
+extern BOOL FreeLibrary(HMODULE);
+extern void *malloc(unsigned long);
+extern void free(void *);
+extern int atoi(const char *);
+extern void exit(int);
+extern void atexit(void (*)(void));
+extern HDEVINFO SetupDiGetClassDevs(const GUID *, const char *, HWND, DWORD);
+extern BOOL SetupDiEnumDeviceInterfaces(HDEVINFO, PSP_DEVINFO_DATA, const GUID *, DWORD, PSP_DEVICE_INTERFACE_DATA);
+extern BOOL SetupDiGetDeviceInterfaceDetail(HDEVINFO, PSP_DEVICE_INTERFACE_DATA, PSP_DEVICE_INTERFACE_DETAIL_DATA, DWORD, DWORD *, PSP_DEVINFO_DATA);
+extern BOOL SetupDiDestroyDeviceInfoList(HDEVINFO);
+extern void HidD_GetHidGuid(LPGUID);
+extern BOOL HidD_GetAttributes(HANDLE, PHIDD_ATTRIBUTES);
+extern BOOL HidD_SetNumInputBuffers(HANDLE, ULONG);
+extern BOOL HidD_GetNumInputBuffers(HANDLE, PULONG);
+extern BOOL HidD_GetFeature(HANDLE, PVOID, ULONG);
+extern BOOL HidD_SetFeature(HANDLE, PVOID, ULONG);
+extern BOOL HidD_GetInputReport(HANDLE, PVOID, ULONG);
+extern BOOL HidD_SetOutputReport(HANDLE, PVOID, ULONG);
+extern BOOL HidD_GetManufacturerString(HANDLE, PVOID, ULONG);
+extern BOOL HidD_GetProductString(HANDLE, PVOID, ULONG);
+#define GENERIC_READ    0x80000000
+#define GENERIC_WRITE   0x40000000
+#define FILE_SHARE_READ   1
+#define FILE_SHARE_WRITE  2
+#define OPEN_EXISTING     3
+#define FILE_FLAG_OVERLAPPED  0x40000000
+#define DIGCF_PRESENT         0x2
+#define DIGCF_DEVICEINTERFACE 0x10
+#define DIGCF_INTERFACEDEVICE 0x10
 #endif
 """,
     "winsock2.h": """#ifndef _WINSOCK2_H

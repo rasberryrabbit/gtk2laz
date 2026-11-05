@@ -1115,6 +1115,8 @@ _KNOWN_TYPEDEFS = {
     "SP_DEVICE_INTERFACE_DETAIL_DATA", "PSP_DEVICE_INTERFACE_DETAIL_DATA",
     "SP_DEVINFO_DATA", "PSP_DEVINFO_DATA",
     "HIDD_ATTRIBUTES", "PHIDD_ATTRIBUTES",
+    "OVERLAPPED", "LPOVERLAPPED",
+    "HDEVINFO", "PCSTR", "PCWSTR", "PULONG",
     "fd_set", "ssize_t",
     # GtkTreeModel and related (used in opgui.c)
     "GtkTreeModel", "GtkTreeSelection", "GtkCellRendererText",
@@ -1503,6 +1505,15 @@ class BodyTranslator:
         # Extra type names that should be treated as valid C types when
         # deciding whether a statement is a local declaration.
         self._extra_known_types: set[str] = set()
+        # Names declared via ``typedef`` earlier in this function body.
+        # Used to distinguish *real* local typedefs (e.g.
+        # ``typedef void (__stdcall*GETHIDGUID)(...);`` followed by
+        # ``GETHIDGUID HidD_GetHidGuid=0;``) from ordinary ALL-CAPS
+        # Windows types like ``DWORD``, ``HMODULE``, ``BOOL`` etc.
+        # that are *already* in ``_KNOWN_TYPEDEFS`` and should be
+        # emitted as normal local variable declarations, not as
+        # "local typedef" comments.
+        self._local_typedef_names: set[str] = set()
 
     def _pascalify(self, name: str) -> str:
         """Like pascalify_name, but also records the C→Pascal name
@@ -1760,9 +1771,15 @@ class BodyTranslator:
                     # that the translator can't parse.
                     # Exception: ``} else ...`` and ``} while ...``
                     # continue the current statement.
+                    # Exception: ``} NAME, *PNAME;`` — this is the
+                    # closing brace of a ``typedef struct { ... } NAME;``
+                    # The NAME and ``;`` are PART of the typedef statement,
+                    # so we must NOT split here.
                     after = src[i+1:].lstrip()
                     if not (after.startswith("else")
-                            or after.startswith("while")):
+                            or after.startswith("while")
+                            or re.match(r'\w+\s*[,;]', after)
+                            or re.match(r'\*\w+\s*[,;]', after)):
                         out.append("".join(cur))
                         cur = []
             elif ch == "(":
@@ -2098,7 +2115,7 @@ class BodyTranslator:
         if s.startswith("while") and (s[5:6] == "(" or s[5:6].isspace()):
             self._translate_while(s)
             return
-        if s.startswith("do") and (s[2:3] in (" ", "\t", "{") or len(s) == 2):
+        if s.startswith("do") and (s[2:3] in (" ", "\t", "\n", "{") or len(s) == 2):
             self._translate_do(s)
             return
         if s.startswith("switch"):
@@ -2152,7 +2169,25 @@ class BodyTranslator:
                 if rest:
                     self._translate_statement(rest)
                 return
-        if s.startswith("{") and s.endswith("}"):
+        # --- Compound block ``{ ... }`` ---
+        # C treats ``{ stmt1; stmt2; }`` as a single compound statement.
+        # When the splitter (or the switch/case handler that appends a
+        # trailing ``;`` for non-compound case bodies) hands us a
+        # statement like ``{ ... };`` we must strip the trailing ``;``
+        # *before* checking whether the statement is a compound block.
+        # Otherwise a multi-statement case body such as
+        #   ``case SDT_STRING: { char *nameA, *nameB; ... break; }``
+        # would fail the ``endswith("}")`` check (because it ends with
+        # ``};``) and fall through to the TODO emitter — losing every
+        # statement inside the case body, including the local
+        # ``char *nameA, *nameB;`` multi-pointer declaration.
+        s_compound = s
+        if s_compound.endswith(";"):
+            # Strip trailing ``;`` for the compound-block check below.
+            # ``{ ... };`` -> ``{ ... }``. We keep the original ``s``
+            # untouched for the rest of the function.
+            s_compound = s_compound[:-1].rstrip()
+        if s_compound.startswith("{") and s_compound.endswith("}"):
             # Compound block: split the inner content into statements
             # and recurse on each.  We use a dedicated splitter that
             # splits on ``;`` even inside ``{ }`` blocks (unlike
@@ -2163,11 +2198,109 @@ class BodyTranslator:
             # compound block that ``_split_statements`` treats as one
             # statement.  By splitting inside the compound block we
             # can translate each statement individually.
-            inner = s[1:-1]
+            inner = s_compound[1:-1]
             for sub in self._split_compound_block(inner):
                 if sub.strip():
                     self._translate_statement(sub.strip())
             return
+
+        # --- Local typedef declarations ---
+        # C allows typedef inside function bodies (local typedefs).
+        # These create local type aliases. In Pascal, there's no exact
+        # equivalent, but we can emit them as comments so the user
+        # can add them by hand if needed. We handle:
+        #   1. typedef struct { ... } NAME, *PNAME;
+        #   2. typedef RET_TYPE (*NAME)(params);
+        #   3. typedef RET_TYPE (CALLBACK *NAME)(params);
+        #   4. } NAME, *PNAME; (closing brace of typedef struct)
+        #   5. TYPE_NAME var = 0; (local var using a local typedef)
+        if s.startswith("typedef"):
+            # typedef struct/union { ... } NAME;
+            m_td_struct = re.match(
+                r"^typedef\s+(?:struct|union)\s+\w*\s*\{.*?\}"
+                r"\s+([A-Za-z_]\w*(?:\s*,\s*\*[A-Za-z_]\w*)?)\s*;?\s*$",
+                s, re.DOTALL,
+            )
+            if m_td_struct:
+                names = m_td_struct.group(1)
+                # Record the declared typedef names so subsequent
+                # ``NAME var = init;`` statements can be recognised
+                # as using a *local* typedef (and emitted as comment)
+                # rather than being mistaken for an ALL-CAPS Windows
+                # type that happens to be in ``_KNOWN_TYPEDEFS``.
+                # Strip leading ``*`` from each name (the pointer
+                # alias form ``*PNAME`` declares both ``NAME`` and
+                # ``PNAME``).
+                for nm in re.findall(r"\*?([A-Za-z_]\w*)", names):
+                    if nm:
+                        self._local_typedef_names.add(nm)
+                self._emit(f"{pad}// local typedef: {names}")
+                return
+            # typedef RET (CALLBACK *NAME)(params);
+            m_td_fptr = re.match(
+                r"^typedef\s+.*?\(.*?\*\s*(\w+)\s*\)\s*\(.*?\)\s*;?\s*$",
+                s, re.DOTALL,
+            )
+            if m_td_fptr:
+                name = m_td_fptr.group(1)
+                self._local_typedef_names.add(name)
+                self._emit(f"{pad}// local typedef: {name}")
+                return
+            # Generic typedef — extract any identifier that looks
+            # like a typedef name (last identifier before the trailing
+            # ``;``). This catches less-common forms such as
+            # ``typedef enum { ... } NAME;`` or ``typedef int NAME;``.
+            m_td_simple = re.search(
+                r"\b([A-Za-z_]\w*)\s*;?\s*$", s,
+            )
+            if m_td_simple:
+                self._local_typedef_names.add(m_td_simple.group(1))
+            self._emit(f"{pad}// local typedef: {s[:100]}")
+            return
+        # } NAME, *PNAME; (closing of typedef struct)
+        if re.match(r"^\}\s+\w+(?:\s*,\s*\*\w+)?\s*;?\s*$", s):
+            # Extract the NAME(s) from ``} NAME, *PNAME;`` so subsequent
+            # variable declarations using these names are recognised.
+            for nm in re.findall(r"\*?([A-Za-z_]\w*)", s):
+                if nm and nm not in ("struct", "union", "enum"):
+                    self._local_typedef_names.add(nm)
+            self._emit(f"{pad}// typedef closing brace")
+            return
+
+        # --- Local variable declarations using local typedefs ---
+        # After local typedefs like ``typedef void (__stdcall*GETHIDGUID)(...);``
+        # the code declares variables like ``GETHIDGUID HidD_GetHidGuid=0;``
+        # These are local type names that are NOT in _KNOWN_TYPEDEFS. We
+        # detect them by checking if the first word is ALL_CAPS (a
+        # convention for Windows API function-pointer typedefs) and is
+        # NOT already a known global typedef.  Names that ARE in
+        # ``_KNOWN_TYPEDEFS`` (e.g. ``DWORD``, ``HMODULE``, ``BOOL``,
+        # ``UINT``, ``HANDLE``, ``HWND``, ``LPSTR`` ...) must fall
+        # through to the regular local-variable handler below so the
+        # user gets a real ``var x: DWORD;`` declaration instead of a
+        # dropped comment.
+        m_ltd = re.match(r"^([A-Z][A-Z_0-9]+)\s+(\w+)\s*=", s)
+        if m_ltd:
+            td_name = m_ltd.group(1)
+            # Only treat as a local-typedef-based declaration when the
+            # name was actually declared via ``typedef`` earlier in
+            # this function body — OR it's an ALL-CAPS name we've never
+            # heard of (so it likely IS a local Windows function-pointer
+            # typedef we failed to capture, e.g. one declared in a
+            # sibling branch that the pattern walker didn't reach).
+            # In both cases fall through if the name is a known global
+            # typedef or C keyword; those are real types, not local
+            # typedefs.
+            is_known = (
+                td_name in _KNOWN_TYPEDEFS
+                or td_name in _C_TYPE_KEYWORDS
+                or td_name in self._extra_known_types
+            )
+            if not is_known:
+                self._emit(f"{pad}// local var (local typedef): {s[:100]}")
+                return
+            # Otherwise fall through to the regular local-variable
+            # declaration handler below.
 
         # --- Local variable declarations ---
         # Only treat as a declaration if the first word is a known C type
@@ -2198,22 +2331,47 @@ class BodyTranslator:
             # If rest starts with '=' (e.g. ``int b = 5`` was parsed as
             # type="int b", rest="= 5"), the last word of type_str is
             # actually the variable name. Move it to rest.
+            # ``looks_like_assignment`` is True when type_str had only
+            # one word and rest starts with ``=`` — in that case the
+            # statement is an *assignment* (e.g.
+            # ``MyDeviceDetected = TRUE;``), not a declaration, and we
+            # must NOT let the "looks-like-a-typedef" heuristic below
+            # misfire on it.
+            looks_like_assignment = False
             if rest.startswith("="):
                 parts = type_str.rsplit(None, 1)
                 if len(parts) == 2:
                     var_name = parts[1]
                     type_str = parts[0]
                     rest = var_name + " " + rest
+                else:
+                    # type_str has only one word and rest starts with
+                    # ``=`` — this is NOT a declaration (e.g.
+                    # ``MyDeviceDetected = TRUE;`` is an assignment to
+                    # an already-declared variable, not a declaration
+                    # of a variable named ``= TRUE`` with type
+                    # ``MyDeviceDetected``).  Don't treat it as a
+                    # declaration; let the assignment handler below
+                    # process it as ``MyDeviceDetected := True;``.
+                    # Without this guard, the heuristic below would
+                    # match mixed-case ``MyDeviceDetected`` as a
+                    # "looks-like-a-typedef" type and emit a
+                    # nonsensical ``__TRUE: TMyDeviceDetected;`` var
+                    # declaration.
+                    looks_like_assignment = True
             # Check if the first word is a C type keyword or known typedef.
             # Strip trailing ``*`` (pointer) so that ``GtkTextTag*`` is
             # recognised as the typedef ``GtkTextTag``.
             first_word = type_str.split()[0] if type_str.split() else ""
             first_word_stripped = first_word.rstrip("*")
-            if first_word in _C_TYPE_KEYWORDS or first_word in _KNOWN_TYPEDEFS \
-                    or first_word_stripped in _C_TYPE_KEYWORDS \
-                    or first_word_stripped in _KNOWN_TYPEDEFS \
-                    or first_word in self._extra_known_types \
-                    or first_word_stripped in self._extra_known_types:
+            if not looks_like_assignment and (
+                    first_word in _C_TYPE_KEYWORDS
+                    or first_word in _KNOWN_TYPEDEFS
+                    or first_word_stripped in _C_TYPE_KEYWORDS
+                    or first_word_stripped in _KNOWN_TYPEDEFS
+                    or first_word in self._extra_known_types
+                    or first_word_stripped in self._extra_known_types
+                    or first_word_stripped in self._local_typedef_names):
                 self._translate_local_decl(type_str, rest)
                 return
             # Heuristic fallback: many C libraries use typedef names that
@@ -2230,7 +2388,7 @@ class BodyTranslator:
             # The same heuristic is already used by ``_extract_prototypes``
             # for parameter type detection, so this keeps the two paths
             # consistent.
-            if first_word_stripped and (
+            if not looks_like_assignment and first_word_stripped and (
                 # Mixed-case typedef name: starts with uppercase, contains
                 # at least one lowercase letter (e.g. ``GtkWidget``,
                 # ``ENetSymbol``, ``GtkWindow``).
@@ -2559,7 +2717,7 @@ class BodyTranslator:
                         and not (step.startswith(f"{var} = ") and
                                  (step.endswith("+ 1") or
                                   step.endswith("+1"))):
-                    self._translate_statement(step + ";")
+                    self._emit_for_step(step)
                 self.indent -= 1
                 self._emit(f"{pad}end;")
                 self._process_for_trailing(tail_str, pad)
@@ -2634,7 +2792,7 @@ class BodyTranslator:
                 elif step == f"{var}--" or step == f"--{var}":
                     self._emit(f"{self._pad()}Dec({var});")
                 else:
-                    self._translate_statement(step + ";")
+                    self._emit_for_step(step)
             self.indent -= 1
             self._emit(f"{pad}end;")
             self._process_for_trailing(tail_str, pad)
@@ -2689,7 +2847,7 @@ class BodyTranslator:
                     elif re.match(rf"\s*--{re.escape(step_var)}", step):
                         self._emit(f"{self._pad()}Dec({step_var});")
                     else:
-                        self._translate_statement(step + ";")
+                        self._emit_for_step(step)
                 self.indent -= 1
                 self._emit(f"{pad}end;")
                 self._process_for_trailing(tail_str, pad)
@@ -2741,7 +2899,7 @@ class BodyTranslator:
                         m_s = re.match(rf"\s*{re.escape(var)}\s*-=\s*(.+)", step)
                         self._emit(f"{self._pad()}Dec({var}, {self._translate_expr(m_s.group(1).strip())});")
                     else:
-                        self._translate_statement(step + ";")
+                        self._emit_for_step(step)
                 self.indent -= 1
                 self._emit(f"{pad}end;")
                 self._process_for_trailing(tail_str, pad)
@@ -2780,7 +2938,7 @@ class BodyTranslator:
                                 self._translate_statement(sub.strip())
                         # Emit step
                         if step:
-                            self._translate_statement(step + ";")
+                            self._emit_for_step(step)
                         self.indent -= 1
                         self._emit(f"{pad}end;")
                         self._process_for_trailing(tail_str, pad)
@@ -2850,7 +3008,7 @@ class BodyTranslator:
             # Emit the step clause as the last statement in the
             # while body.  This is where C runs the step clause —
             # after each iteration of the body.
-            self._translate_statement(step + ";")
+            self._emit_for_step(step)
         self.indent -= 1
         self._emit(f"{pad}end;")
 
@@ -3013,9 +3171,55 @@ class BodyTranslator:
                 self._emit(f"{self._pad()}Dec({m_dec_k.group(1)}, "
                            f"{self._translate_expr(m_dec_k.group(2).strip())});")
             else:
-                self._translate_statement(step + ";")
+                self._emit_for_step(step)
         self.indent -= 1
         self._emit(f"{pad}end;")
+
+    # ------------------------------------------------------------------
+    def _emit_for_step(self, step: str) -> None:
+        """Emit a C for-loop ``step`` clause as one or more Pascal statements.
+
+        C's for-loop step is a comma-separated expression list (e.g.
+        ``i++, j++`` or ``i = i+2, k--``). Pascal has no equivalent
+        comma operator, so we split the step on top-level commas and
+        translate each expression as its own statement.
+
+        Each piece can be:
+          * a simple increment/decrement (``i++``, ``--j``) → ``Inc(i)`` / ``Dec(j)``
+          * an augmented assignment (``i += 2``) → ``Inc(i, 2)``
+          * any other assignment expression → translate as a statement
+        """
+        if not step or not step.strip():
+            return
+        # Split on top-level commas (respecting parens/brackets/strings)
+        pieces = _split_top_level(step, ",")
+        for piece in pieces:
+            piece = piece.strip()
+            if not piece:
+                continue
+            pad = self._pad()
+            # Try simple increment / decrement
+            m_inc = re.match(r"^(?:\+\+)?(\w+)\s*\+\+\s*$", piece) or \
+                    re.match(r"^\+\+(\w+)\s*$", piece)
+            m_dec = re.match(r"^(\w+)\s*--\s*$", piece) or \
+                    re.match(r"^--(\w+)\s*$", piece)
+            m_inc_k = re.match(r"^(\w+)\s*\+=\s*(.+)$", piece)
+            m_dec_k = re.match(r"^(\w+)\s*-=\s*(.+)$", piece)
+            if m_inc:
+                self._emit(f"{pad}Inc({m_inc.group(1)});")
+            elif m_dec:
+                self._emit(f"{pad}Dec({m_dec.group(1)});")
+            elif m_inc_k:
+                self._emit(f"{pad}Inc({m_inc_k.group(1)}, "
+                           f"{self._translate_expr(m_inc_k.group(2).strip())});")
+            elif m_dec_k:
+                self._emit(f"{pad}Dec({m_dec_k.group(1)}, "
+                           f"{self._translate_expr(m_dec_k.group(2).strip())});")
+            else:
+                # Fall back to general statement translation. This
+                # handles regular assignments (``i = i + 2``), function
+                # calls, etc.
+                self._translate_statement(piece + ";")
 
     def _translate_while(self, s: str) -> None:
         pad = self._pad()
@@ -3071,11 +3275,28 @@ class BodyTranslator:
                 return
             body = rest[:while_idx].strip()
             tail = rest[while_idx:]
-        m = re.match(r"\s*while\s*\((.*?)\)\s*;?", tail, re.DOTALL)
+        m = re.match(r"\s*while\s*\(", tail, re.DOTALL)
         if not m:
             self._emit_todo(s, "do-while without while")
             return
-        cond = self._translate_cond(m.group(1))
+        # Extract the parenthesized condition with proper nesting
+        # (a non-greedy `(.*?)` would stop at the first `)` inside
+        # conditions like ``(a == 1) && (b == 2)``). We use
+        # ``_extract_paren`` instead which tracks paren depth.
+        open_idx = m.end() - 1   # position of '('
+        cond, after_cond = self._extract_paren(tail, open_idx)
+        if not cond and not after_cond:
+            # _extract_paren hit end-of-string without finding the
+            # closing ')' — fall back to the old regex behaviour so we
+            # at least emit *something* (the regex is non-greedy and
+            # may not capture the full condition, but a partial
+            # translation is better than a TODO).
+            m2 = re.match(r"\s*while\s*\((.*?)\)\s*;?", tail, re.DOTALL)
+            if not m2:
+                self._emit_todo(s, "do-while without while")
+                return
+            cond = m2.group(1)
+        cond = self._translate_cond(cond)
         self._emit(f"{pad}repeat")
         self.indent += 1
         if body:
