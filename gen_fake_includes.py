@@ -357,6 +357,29 @@ typedef void* GObject;
 #define GTK_SPIN_BUTTON(s) ((GtkSpinButton*)(s))
 #define GTK_COMBO_BOX(c) ((GtkComboBox*)(c))
 #define GTK_NOTEBOOK(n) ((GtkNotebook*)(n))
+#define GTK_ENTRY(e) ((GtkEntry*)(e))
+#define GTK_DIALOG(d) ((GtkDialog*)(d))
+#define GTK_FILE_CHOOSER(w) ((GtkFileChooser*)(w))
+#define GTK_WIDGET(w) ((GtkWidget*)(w))
+#define GTK_BIN(b) ((GtkBin*)(b))
+#define GTK_CONTAINER(c) ((GtkContainer*)(c))
+/* GTK response codes (enum values) */
+#define GTK_RESPONSE_NONE 0
+#define GTK_RESPONSE_REJECT -1
+#define GTK_RESPONSE_ACCEPT -2
+#define GTK_RESPONSE_DELETE_EVENT -3
+#define GTK_RESPONSE_OK -5
+#define GTK_RESPONSE_CANCEL -6
+#define GTK_RESPONSE_CLOSE -7
+#define GTK_RESPONSE_YES -8
+#define GTK_RESPONSE_NO -9
+#define GTK_RESPONSE_APPLY -10
+#define GTK_RESPONSE_HELP -11
+/* GTK file chooser action enum */
+#define GTK_FILE_CHOOSER_ACTION_OPEN 0
+#define GTK_FILE_CHOOSER_ACTION_SAVE 1
+#define GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER 2
+#define GTK_FILE_CHOOSER_ACTION_CREATE_FOLDER 3
 #define GTK_TOOL_BUTTON(t) ((GtkToolButton*)(t))
 #define GTK_TOOLBAR(t) ((GtkToolbar*)(t))
 #define GTK_TREE_SELECTION(s) ((GtkTreeSelection*)(s))
@@ -504,12 +527,71 @@ typedef void *         PVOID;
 typedef void *         LPVOID;
 typedef char *         LPSTR;
 typedef const char *   LPCSTR;
+// Win32 also defines PCSTR/PCWSTR as the ``const char*`` / ``const
+// wchar_t*`` pointer aliases used by setupapi.h (SetupDiGetClassDevs
+// takes a PCSTR), the Win32 API documentation, and many C/C++
+// samples. The ``P`` prefix means ``Pointer to`` (so PCSTR is
+// ``pointer to const char``), while the ``LP`` prefix means ``Long
+// pointer to`` (32-bit/64-bit pointer to). On modern Win32 they are
+// the same type and the SDK provides both spellings. Without these
+// aliases the preprocessed output keeps the literal ``PCSTR``
+// identifier, and pycparser sees it as an undefined ID instead of a
+// TYPEID, so any function-pointer typedef that uses PCSTR as a
+// parameter type (e.g. ``typedef HDEVINFO (*P)(const GUID*,PCSTR,
+// HWND,DWORD);``) aborts with ``Invalid declaration``.
+typedef const char *   PCSTR;
+typedef const wchar_t *PCWSTR;
+typedef wchar_t *      PWSTR;
+// ``PCTSTR`` and ``LPCTSTR`` are the TCHAR-aware versions of PCSTR /
+// LPCSTR (they resolve to the ANSI or UNICODE variant based on the
+// UNICODE macro). For pycparser we always define them as the ANSI
+// (const char*) variant since we never define UNICODE in our fake
+// headers — this matches what real Win32 builds without UNICODE
+// would see.
+typedef const char *   PCTSTR;
+typedef const char *   LPCTSTR;
+// ``HDEVINFO`` is a handle to a device information set returned by
+// SetupDiGetClassDevs. The fake windows.h was missing it; without
+// the typedef, the typedef'd function pointer in opgui's
+// FindDevice() that uses HDEVINFO as both a return type and a
+// parameter type makes pycparser abort with ``Invalid
+// declaration`` on the typedef line.
+typedef void *         HDEVINFO;
+// ``PSP_DEVICE_INTERFACE_DETAIL_DATA_A`` is the ANSI variant of
+// PSP_DEVICE_INTERFACE_DETAIL_DATA (setupapi.h). It's used in the
+// FindDevice function pointer typedef list.
+typedef void *         PSP_DEVICE_INTERFACE_DETAIL_DATA_A;
+typedef void *         PSP_DEVICE_INTERFACE_DETAIL_DATA_W;
+typedef void *         PSP_DEVICE_INTERFACE_DETAIL_DATA;
+// ``PDWORD`` is a pointer to DWORD (used as an out-pointer
+// parameter in SetupDiGetDeviceInterfaceDetail's Required slot).
+typedef unsigned long *PDWORD;
+// ``PCSTR``-style aliases for the Win32 base integer types are
+// sometimes referenced by setupapi prototypes; add them for
+// completeness.
+typedef int            HKEY;
+typedef void *         PHKEY;
+// ``RECT`` and ``POINT`` are commonly used Win32 structures.
+struct RECT { long left; long top; long right; long bottom; };
+struct POINT { long x; long y; };
 typedef int            INT;
 typedef unsigned int   UINT;
 typedef long           LONG;
 typedef unsigned long  ULONG;
 typedef short          SHORT;
 typedef unsigned short USHORT;
+// Win32's ``WCHAR`` is a typedef FOR ``wchar_t`` (i.e.
+// ``typedef wchar_t WCHAR;``). The fake ``wchar.h`` declares
+// ``typedef int wchar_t;`` so pycparser sees ``wchar_t`` as an
+// alias for ``int``. Keeping the SDK's order
+// (``typedef wchar_t WCHAR;``) means the AST typedef chain for
+// ``WCHAR`` is ``WCHAR -> wchar_t -> int``, which is what the
+// downstream Pascal translator flattens to ``WCHAR = int``.
+// REVERSED order (``typedef int WCHAR;`` + ``typedef WCHAR
+// wchar_t;``) would also work but is the OPPOSITE of what the
+// real Win32 headers do, and would produce the wrong Pascal
+// output for any code that expects ``WCHAR`` and ``wchar_t`` to
+// be the same type.
 typedef wchar_t        WCHAR;
 typedef wchar_t *      LPWSTR;
 typedef const wchar_t *LPCWSTR;
@@ -577,22 +659,10 @@ extern void free(void *);
 extern int atoi(const char *);
 extern void exit(int);
 extern void atexit(void (*)(void));
-extern HDEVINFO SetupDiGetClassDevs(const GUID *, const char *, HWND, DWORD);
-extern BOOL SetupDiEnumDeviceInterfaces(HDEVINFO, PSP_DEVINFO_DATA, const GUID *, DWORD, PSP_DEVICE_INTERFACE_DATA);
-extern BOOL SetupDiGetDeviceInterfaceDetail(HDEVINFO, PSP_DEVICE_INTERFACE_DATA, PSP_DEVICE_INTERFACE_DETAIL_DATA, DWORD, DWORD *, PSP_DEVINFO_DATA);
-extern BOOL SetupDiDestroyDeviceInfoList(HDEVINFO);
-extern void HidD_GetHidGuid(LPGUID);
-extern BOOL HidD_GetAttributes(HANDLE, PHIDD_ATTRIBUTES);
-extern BOOL HidD_SetNumInputBuffers(HANDLE, ULONG);
-extern BOOL HidD_GetNumInputBuffers(HANDLE, PULONG);
-extern BOOL HidD_GetFeature(HANDLE, PVOID, ULONG);
-extern BOOL HidD_SetFeature(HANDLE, PVOID, ULONG);
-extern BOOL HidD_GetInputReport(HANDLE, PVOID, ULONG);
-extern BOOL HidD_SetOutputReport(HANDLE, PVOID, ULONG);
-extern BOOL HidD_GetManufacturerString(HANDLE, PVOID, ULONG);
-extern BOOL HidD_GetProductString(HANDLE, PVOID, ULONG);
 #define GENERIC_READ    0x80000000
 #define GENERIC_WRITE   0x40000000
+#define TRUE            1
+#define FALSE           0
 #define FILE_SHARE_READ   1
 #define FILE_SHARE_WRITE  2
 #define OPEN_EXISTING     3

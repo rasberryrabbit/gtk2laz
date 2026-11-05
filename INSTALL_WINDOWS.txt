@@ -1,0 +1,43 @@
+gtk2laz v1.4 - Windows 설치 방법
+================================
+
+방법 1: Python 소스 직접 실행 (권장)
+----------------------------------
+1. Python 3.8+ 설치 (https://www.python.org/downloads/)
+   - 설치 시 "Add Python to PATH" 체크 필수
+
+2. 의존 패키지 설치:
+   pip install pycparser pcpp
+
+3. (선택) ply 패키지 설치 - 이미 소스 폴더에 포함되어 있어 생략 가능:
+   pip install ply
+
+4. 실행:
+   windows\gtk2laz_win.bat gui
+   windows\gtk2laz_win.bat convert E:\path\to\source E:\path\to\output
+   windows\gtk2laz_win.bat c2pas E:\path\to\source E:\path\to\output
+
+방법 2: 단일 .exe 빌드 (PyInstaller)
+----------------------------------
+1. 위 1-3단계 수행
+
+2. 추가로 PyInstaller 설치:
+   pip install pyinstaller
+
+3. 빌드:
+   build_win_exe.bat
+
+4. 생성된 실행 파일:
+   dist\gtk2laz.exe
+
+
+v1.4 변경 사항
+=============
+* 버전 1.3 → 1.4
+* GTK_STATUSBAR(x)=((x)) 등 ``=`` 구분자 매크로 정상 처리
+  (이전: ``gtk_statusbar_push(=((status_bar)),...)`` → 이제: ``gtk_statusbar_push(((status_bar)),...)``)
+* fake windows.h에 PCSTR, PCWSTR, HDEVINFO, PSP_DEVICE_INTERFACE_DETAIL_DATA_A,
+  PDWORD, HKEY 등 누락된 Win32 타입 추가
+* typedef-to-typedef 체인 평탄화
+  (예: typedef wchar_t WCHAR → ``TWCHAR = Integer;`` 로 직접 평탄화)
+* wchar_t 매크로 정의 제거 → typedef로 처리 (``typedef int int;`` 버그 수정)

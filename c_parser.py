@@ -2436,6 +2436,64 @@ class BodyTranslator:
         if m_pre_dec:
             self._emit(f"{pad}Dec({m_pre_dec.group(1)});")
             return
+        # Dereference + increment/decrement: ``(*err)++`` → ``Inc(err^)``
+        m_deref_inc = re.match(r"^\(\s*\*\s*(\w+)\s*\)\s*\+\+\s*;?$", s)
+        if m_deref_inc:
+            self._emit(f"{pad}Inc({m_deref_inc.group(1)}^);")
+            return
+        m_deref_dec = re.match(r"^\(\s*\*\s*(\w+)\s*\)\s*--\s*;?$", s)
+        if m_deref_dec:
+            self._emit(f"{pad}Dec({m_deref_dec.group(1)}^);")
+            return
+        # Pointer member access: ``packet->ref--`` → ``Dec(packet^.ref)``
+        m_ptr_inc = re.match(
+            r"^([\w\->\.\[\]\s]+?)\s*\+\+\s*;?$", s)
+        if m_ptr_inc:
+            target = m_ptr_inc.group(1).strip()
+            pas_target = self._translate_expr(target)
+            self._emit(f"{pad}Inc({pas_target});")
+            return
+        m_ptr_dec = re.match(
+            r"^([\w\->\.\[\]\s]+?)\s*--\s*;?$", s)
+        if m_ptr_dec:
+            target = m_ptr_dec.group(1).strip()
+            pas_target = self._translate_expr(target)
+            self._emit(f"{pad}Dec({pas_target});")
+            return
+        m_ptr_pre_inc = re.match(
+            r"^\+\+\s*([\w\->\.\[\]\s]+?)\s*;?$", s)
+        if m_ptr_pre_inc:
+            target = m_ptr_pre_inc.group(1).strip()
+            pas_target = self._translate_expr(target)
+            self._emit(f"{pad}Inc({pas_target});")
+            return
+        m_ptr_pre_dec = re.match(
+            r"^--\s*([\w\->\.\[\]\s]+?)\s*;?$", s)
+        if m_ptr_pre_dec:
+            target = m_ptr_pre_dec.group(1).strip()
+            pas_target = self._translate_expr(target)
+            self._emit(f"{pad}Dec({pas_target});")
+            return
+        # Function-pointer call: ``(* ptr->member)(args)`` → ``ptr^.member^(args)``
+        m_funcptr = re.match(r"^\(\s*\*\s*([\w\->\.\[\]\s]+?)\s*\)\s*\((.*)\)\s*;?\s*$", s, re.S)
+        if m_funcptr:
+            func_expr = m_funcptr.group(1).strip()
+            args = m_funcptr.group(2)
+            pas_func = self._translate_expr(func_expr)
+            pas_args = self._translate_args(args)
+            self._emit(f"{pad}{pas_func}^({pas_args});")
+            return
+        # Cast + function-pointer call: ``((CAST)(EXPR))(ARGS);``
+        m_cast_call = re.match(
+            r"^(.*?)\(([\w\->\.\[\]\s]+?)\)\s*\)\s*\((.*)\)\s*;?\s*$",
+            s, re.S)
+        if m_cast_call:
+            func_expr = m_cast_call.group(2).strip()
+            args = m_cast_call.group(3)
+            pas_func = self._translate_expr(func_expr)
+            pas_args = self._translate_args(args)
+            self._emit(f"{pad}{pas_func}^({pas_args});")
+            return
 
         # --- Fallback ---
         self._emit_todo(s, "unrecognised statement")
@@ -5601,8 +5659,16 @@ class CFileTranslator:
                       f"macros for inlining", file=sys.stderr)
                 src_clean = _expand_func_macros_in_source(src_clean, func_macros)
                 import tempfile
+                # Use the original .c file basename in the temp file
+                # name so the user can easily identify which source
+                # file the expanded version came from.
+                # e.g. ``gtk2laz_expanded_compress_a1b2c3.c``
+                # instead of the opaque ``gtk2laz_expanded_a1b2c3.c``.
+                _orig_base = os.path.splitext(
+                    os.path.basename(self.c_path))[0]
+                _prefix = f"gtk2laz_expanded_{_orig_base}_"
                 tmp_fd, tmp_path = tempfile.mkstemp(
-                    suffix=".c", prefix="gtk2laz_expanded_",
+                    suffix=".c", prefix=_prefix,
                     dir=os.path.dirname(self.c_path)
                 )
                 try:
@@ -5668,17 +5734,16 @@ class CFileTranslator:
                         file=_sys.stderr)
             except Exception as _e:
                 self._ast_result = None
-                # parse_with_ast() itself raised an exception (not
-                # just returned None). This is rarer but indicates a
-                # real bug in the AST translator. Surface it so the
-                # user can report the issue with a clear error
-                # message.
+                # Print a concise summary and fall back to pattern.
+                # The detailed diagnostic (source line, context,
+                # binary search) was already printed by
+                # ast_translator.parse() before re-raising.
                 import sys as _sys
                 print(
-                    f"gtk2laz: AST translator raised "
-                    f"{type(_e).__name__} on "
-                    f"{os.path.basename(self.c_path)}: {_e} — "
-                    f"falling back to pattern-based translator.",
+                    f"gtk2laz: [{os.path.basename(self.c_path)}] "
+                    f"AST parse failed ({type(_e).__name__}: "
+                    f"{str(_e)[:200]}) — falling back to "
+                    f"pattern-based translator.",
                     file=_sys.stderr)
 
         # ---- Pattern-based fallback (always run for body translation) ----
@@ -7756,10 +7821,25 @@ def _build_one_fake_type_unit(unit_name: str,
     types_decls: list[str] = []
     var_decls: list[str] = []
     func_decls: list[str] = []
+    # Build a typedef-name → Pascal-type map so later typedefs in
+    # the SAME fake-header unit can flatten typedef-to-typedef
+    # chains. For example, in windows.h we have:
+    #     typedef int wchar_t;  (from wchar.h, prepended by _read_all_fake_headers)
+    #     typedef wchar_t WCHAR;
+    # Without flattening, the emitted Pascal would be:
+    #     Twchar_t = Integer;
+    #     TWCHAR = Twchar_t;        <- references Twchar_t
+    # With flattening, the second typedef uses the resolved base
+    # type directly:
+    #     TWCHAR = Integer;         <- flattened chain
+    # The chain is local to this generated unit — typedefs from
+    # OTHER units (e.g. user's .c file) are not in scope and stay
+    # as Twchar_t-style references.
+    typedef_chain: dict[str, str] = {}
     try:
         from ast_translator import (
             _type_to_pascal, _typedef_to_pas,
-            _decl_to_func_signature,
+            _decl_to_func_signature, _pascalize_type,
         )
         from pycparser import CParser, c_ast
         parser = CParser()
@@ -7768,14 +7848,26 @@ def _build_one_fake_type_unit(unit_name: str,
             if isinstance(ext, c_ast.Typedef):
                 if ext.name and ext.name.startswith("_"):
                     continue  # skip internal tags
-                td = _typedef_to_pas(ext)
+                td = _typedef_to_pas(ext, typedef_chain)
                 if td and td.pascal_decl:
                     types_decls.append(td.pascal_decl)
+                    # Record the resolved Pascal type so later
+                    # typedefs in the same unit can flatten to it.
+                    decl_str = td.pascal_decl.strip()
+                    if "=" in decl_str:
+                        rhs = (decl_str.split("=", 1)[1]
+                               .strip().rstrip(";").strip())
+                        if td.kind == "typedef":
+                            typedef_chain[td.name] = rhs
+                        else:
+                            typedef_chain[td.name] = _pascalize_type(td.name)
                 else:
                     pas_type = _type_to_pascal(ext.type)
                     name = ext.name
                     if name and pas_type:
-                        types_decls.append(f"  T{name} = {pas_type};")
+                        decl_line = f"  T{name} = {pas_type};"
+                        types_decls.append(decl_line)
+                        typedef_chain[name] = pas_type
             elif isinstance(ext, c_ast.Decl):
                 if ext.storage and "extern" in ext.storage:
                     pas_type = _type_to_pascal(ext.type)

@@ -554,8 +554,36 @@ def _decl_to_global(decl) -> Optional[AstGlobal]:
     return AstGlobal(name=name, pascal_type=ptype, init=init)
 
 
-def _typedef_to_pas(typedef) -> Optional[AstTypeDef]:
-    """Convert a c_ast.Typedef to a Pascal type declaration."""
+def _typedef_to_pas(typedef, typedef_chain: Optional[dict] = None) -> Optional[AstTypeDef]:
+    """Convert a c_ast.Typedef to a Pascal type declaration.
+
+    ``typedef_chain`` (when provided by the caller) is a dict
+    mapping already-emitted typedef names → their Pascal type
+    string. When the typedef's inner type is itself a typedef name
+    (e.g. ``typedef wchar_t WCHAR;`` where ``wchar_t`` is itself
+    ``typedef int wchar_t;``), we look up the inner name in the
+    chain and substitute the resolved Pascal type. This flattens
+    the chain so the emitted Pascal declaration uses the BASE
+    Pascal type directly:
+
+        typedef int wchar_t;        → Twchar_t = Integer;
+        typedef wchar_t WCHAR;      → TWCHAR = Integer;     (not TWCHAR = Twchar_t;)
+
+    Without flattening, the output would be ``TWCHAR = Twchar_t;``
+    which is semantically correct in Pascal too, but produces
+    inconsistent output vs. the pattern-based translator (which
+    expands the chain by macro substitution). The flatten step
+    keeps both translators producing identical output.
+
+    We do NOT flatten when:
+      * the inner type is a struct/enum/union with a body — those
+        get their own ``T<Name> = record/enum`` declaration and
+        the typedef just becomes ``T<Name> = T<InnerName>;``
+      * the inner typedef name is not in ``typedef_chain`` (e.g.
+        it was defined in another unit, or it's a system type
+        like ``int``/``char`` that we resolve directly via
+        ``_C_TYPE_TO_PASCAL``).
+    """
     name = typedef.name
     if not name:
         return None
@@ -570,6 +598,25 @@ def _typedef_to_pas(typedef) -> Optional[AstTypeDef]:
         if isinstance(inner.type, c_ast.Union):
             return _union_typedef_to_pas(name, inner.type)
     # Simple typedef: typedef OLD NEW;
+    # If OLD is itself a typedef name we've already emitted, flatten
+    # the chain so the Pascal output uses the BASE Pascal type
+    # (e.g. ``TWCHAR = Integer`` instead of ``TWCHAR = Twchar_t``).
+    if typedef_chain is not None and isinstance(inner, c_ast.TypeDecl):
+        inner_id = inner.type
+        if isinstance(inner_id, c_ast.IdentifierType) and inner_id.names:
+            # ``IdentifierType.names`` is a list because C allows
+            # multi-token type names like ``unsigned long``. For a
+            # typedef-to-typedef chain, the list has exactly ONE
+            # element (the typedef name). We only flatten when
+            # that single name is in our chain map.
+            if len(inner_id.names) == 1:
+                inner_name = inner_id.names[0]
+                if inner_name in typedef_chain:
+                    resolved = typedef_chain[inner_name]
+                    return AstTypeDef(
+                        name=name, kind="typedef",
+                        pascal_decl=f"  {_pascalize_type(name)} = {resolved};",
+                    )
     old_type = _type_to_pascal(inner)
     return AstTypeDef(name=name, kind="typedef",
                       pascal_decl=f"  {_pascalize_type(name)} = {old_type};")
@@ -917,126 +964,113 @@ class AstToPascal:
         # ---- Parse the preprocessed text with pycparser ----
         print(f"gtk2laz: [{_src_basename}] parsing with pycparser "
               f"({len(text) if text else 0} bytes)...", file=sys.stderr)
+        from pycparser import CParser
+        parser = CParser()
         try:
-            from pycparser import CParser
-            parser = CParser()
             ast = parser.parse(text, filename=self.c_path)
             print(f"gtk2laz: [{_src_basename}] pycparser OK",
                   file=sys.stderr)
         except Exception as e:
-            # pycparser raises ParseError when it hits an undefined type
-            # name (e.g. ``fd_set``, ``struct timespec``, ...) or a
-            # missing type in a declaration (e.g. when a #define that
-            # expands to a type was stripped because we're on the raw
-            # source fallback path).  We try to recover by parsing
-            # the error message for the offending identifier, emitting
-            # a placeholder typedef for it, and re-parsing.  We retry
-            # up to 10 times so a chain of missing types
-            # (``fd_set`` -> ``timeval`` -> ``port`` -> ...) can be
-            # resolved in one go.
-            print(f"gtk2laz: [{_src_basename}] pycparser initial "
-                  f"parse failed: {str(e)[:300]}", file=sys.stderr)
-            ast = None
-            err_msg = str(e)
-            self.parse_error = err_msg
-            for _retry in range(10):
-                missing = _extract_missing_type_from_error(err_msg)
-                if not missing:
-                    print(f"gtk2laz: [{_src_basename}] retry "
-                          f"{_retry}: no missing type extracted, "
-                          f"giving up", file=sys.stderr)
-                    break
-                # "Missing type in declaration" — the missing name is a
-                # sentinel like ``__MISSING_TYPE_LINE_<N>__``.  We look
-                # up line <N> in the source text and extract the first
-                # identifier that looks like a variable name, then emit
-                # an ``int`` typedef for it.
-                if missing.startswith("__MISSING_TYPE_LINE_"):
-                    line_num_str = missing[len("__MISSING_TYPE_LINE_"):-2]
-                    try:
-                        line_num = int(line_num_str)
-                        src_lines = text.splitlines()
-                        if 0 < line_num <= len(src_lines):
-                            err_line = src_lines[line_num - 1]
-                            # Extract the first identifier that could be
-                            # a variable name (alphanumeric, starts with
-                            # a letter or underscore).
-                            m_id = _re.search(
-                                r"\b([A-Za-z_]\w*)\s*[=;\[,\)]", err_line
-                            )
-                            if m_id:
-                                var_name = m_id.group(1)
-                                text = f"typedef int {var_name};\n" + text
-                                print(f"gtk2laz: [{_src_basename}] retry "
-                                      f"{_retry}: injecting "
-                                      f"typedef int {var_name}; "
-                                      f"(from line {line_num})",
-                                      file=sys.stderr)
-                                # Re-parse and continue the retry loop.
-                                try:
-                                    parser2 = CParser()
-                                    ast = parser2.parse(text,
-                                                        filename=self.c_path)
-                                    self.parse_error = ""
-                                    print(f"gtk2laz: [{_src_basename}] "
-                                          f"retry {_retry}: pycparser OK",
-                                          file=sys.stderr)
-                                    break
-                                except Exception as e2:
-                                    err_msg = str(e2)
-                                    self.parse_error = err_msg
-                                    print(f"gtk2laz: [{_src_basename}] "
-                                          f"retry {_retry}: still "
-                                          f"failing: "
-                                          f"{err_msg[:200]}",
-                                          file=sys.stderr)
-                                    continue
-                            else:
-                                print(f"gtk2laz: [{_src_basename}] "
-                                      f"retry {_retry}: no identifier "
-                                      f"found on line {line_num} "
-                                      f"({err_line[:80]!r})",
-                                      file=sys.stderr)
-                    except (ValueError, IndexError):
-                        pass
-                    # If we couldn't extract a variable name, stop
-                    # retrying to avoid an infinite loop.
-                    break
-                # Normal case: ``before: <ident>`` or ``Non-typedef 'X'``
-                # Prepend a placeholder typedef for the missing type so
-                # pycparser can resolve it on the next attempt.
-                if "Missing type" in err_msg:
-                    text = f"typedef int {missing};\n" + text
-                    print(f"gtk2laz: [{_src_basename}] retry {_retry}: "
-                          f"injecting typedef int {missing};",
-                          file=sys.stderr)
-                else:
-                    text = f"typedef struct _{missing} {missing};\n" + text
-                    print(f"gtk2laz: [{_src_basename}] retry {_retry}: "
-                          f"injecting typedef struct _{missing} {missing};",
-                          file=sys.stderr)
-                try:
-                    parser2 = CParser()
-                    ast = parser2.parse(text, filename=self.c_path)
-                    self.parse_error = ""
-                    print(f"gtk2laz: [{_src_basename}] retry {_retry}: "
-                          f"pycparser OK", file=sys.stderr)
-                    break
-                except Exception as e2:
-                    err_msg = str(e2)
-                    self.parse_error = err_msg
-                    print(f"gtk2laz: [{_src_basename}] retry {_retry}: "
-                          f"still failing: {err_msg[:200]}",
-                          file=sys.stderr)
-                    continue
-            if ast is None:
-                print(f"gtk2laz: [{_src_basename}] pycparser parse "
-                      f"FAILED after all retries — returning False",
+            # pycparser failed. Print a detailed diagnostic and
+            # re-raise so the caller (c_parser.py) can catch it
+            # and fall back to the pattern translator.
+            print(f"gtk2laz: [{_src_basename}] pycparser parse "
+                  f"failed: {str(e)[:500]}", file=sys.stderr)
+            # Show the offending source line if available.
+            import re as _re2
+            _err_msg = str(e)
+            _err_loc = _re2.search(
+                r'([^\s:]+):(?:(\d+):)?(?:(\d+):)?\s*(.+)', _err_msg)
+            if _err_loc:
+                _err_file = _err_loc.group(1)
+                _err_line = int(_err_loc.group(2)) if _err_loc.group(2) else 0
+                _err_col = int(_err_loc.group(3)) if _err_loc.group(3) else 0
+                _err_reason = _err_loc.group(4).strip() if _err_loc.group(4) else ""
+                print(f"gtk2laz: [{_src_basename}]   file: {_err_file}",
                       file=sys.stderr)
-                return False
+                if _err_line:
+                    print(f"gtk2laz: [{_src_basename}]   line: {_err_line}, col: {_err_col}",
+                          file=sys.stderr)
+                if _err_reason:
+                    print(f"gtk2laz: [{_src_basename}]   reason: {_err_reason}",
+                          file=sys.stderr)
+                if _err_line and text:
+                    _text_lines = text.splitlines()
+                    _best_dir = -1
+                    _best_num = 0
+                    for _i, _l in enumerate(_text_lines):
+                        if '#line' in _l and os.path.basename(_err_file) in _l:
+                            _m = _re2.search(r'#line\s+(\d+)', _l)
+                            if _m:
+                                _num = int(_m.group(1))
+                                if _num <= _err_line and _num > _best_num:
+                                    _best_num = _num
+                                    _best_dir = _i
+                    if _best_dir >= 0:
+                        _offset = _err_line - _best_num
+                        _idx = _best_dir + _offset
+                        if 0 <= _idx < len(_text_lines):
+                            print(f"gtk2laz: [{_src_basename}]   source: "
+                                  f"{_text_lines[_idx][:200]!r}",
+                                  file=sys.stderr)
+                            for _c in range(max(0, _idx - 1),
+                                            min(len(_text_lines), _idx + 2)):
+                                if _c != _idx:
+                                    print(f"gtk2laz: [{_src_basename}]   context: "
+                                          f"{_text_lines[_c][:200]!r}",
+                                          file=sys.stderr)
+                    elif 0 < _err_line <= len(_text_lines):
+                        print(f"gtk2laz: [{_src_basename}]   source: "
+                              f"{_text_lines[_err_line - 1][:200]!r}",
+                              file=sys.stderr)
+            # If no line number in the error, try binary search to
+            # find the exact failing line.
+            if not _err_line and text:
+                print(f"gtk2laz: [{_src_basename}]   no line number in error — "
+                      f"running binary search to find failing line...",
+                      file=sys.stderr)
+                _text_lines = text.splitlines()
+                _lo, _hi, _last_good = 1, len(_text_lines), 0
+                while _lo < _hi:
+                    _mid = (_lo + _hi) // 2
+                    _partial = "\n".join(_text_lines[:_mid])
+                    _ob = _partial.count("{") - _partial.count("}")
+                    _partial += "}" * max(0, _ob)
+                    try:
+                        CParser().parse(_partial, filename="test")
+                        _last_good = _mid
+                        _lo = _mid + 1
+                    except:
+                        _hi = _mid
+                if _last_good > 0 and _last_good < len(_text_lines):
+                    print(f"gtk2laz: [{_src_basename}]   binary search: "
+                          f"last good line {_last_good}, "
+                          f"first failing line {_last_good + 1}",
+                          file=sys.stderr)
+                    _start = max(0, _last_good - 3)
+                    _end = min(_last_good + 6, len(_text_lines))
+                    for _j in range(_start, _end):
+                        _marker = ">>>" if _j + 1 == _last_good + 1 else "   "
+                        print(f"gtk2laz: [{_src_basename}]   {_marker} "
+                              f"line {_j + 1}: "
+                              f"{_text_lines[_j][:200]!r}",
+                              file=sys.stderr)
+            raise
         # Filter: only keep top-level nodes whose coord.file matches our
         # source file (skip nodes coming from fake headers).
         target = os.path.basename(self.c_path)
+        # Build a typedef-name → Pascal-type map as we walk the AST.
+        # This lets ``_typedef_to_pas`` flatten typedef-to-typedef
+        # chains (e.g. ``typedef wchar_t WCHAR;`` where ``wchar_t``
+        # is itself ``typedef int wchar_t;``). pycparser gives us
+        # the typedefs in source order, so by the time we reach
+        # ``typedef wchar_t WCHAR;`` we have already seen
+        # ``typedef int wchar_t;`` and recorded its Pascal type
+        # (``Integer``) in the chain. The chain is local to this
+        # file — typedefs from OTHER units (e.g. ``size_t`` from
+        # sys_types.pas) are NOT in the chain, so they stay as
+        # ``Twchar_t`` / ``Tsize_t`` style references.
+        typedef_chain: dict[str, str] = {}
         for ext in ast.ext:
             coord_file = ""
             if ext.coord and ext.coord.file:
@@ -1057,9 +1091,28 @@ class AstToPascal:
                 continue
             # Typedef
             if isinstance(ext, c_ast.Typedef):
-                td = _typedef_to_pas(ext)
+                td = _typedef_to_pas(ext, typedef_chain)
                 if td:
                     self.typedefs.append(td)
+                    # Record the resolved Pascal type so later
+                    # typedefs in the same file can chain off it.
+                    # Extract the RHS of ``T<Name> = <RHS>;``.
+                    # The Pascal decl format is always
+                    # ``  T<Name> = <RHS>;`` — split on first ``= ``.
+                    decl = td.pascal_decl.strip()
+                    if "=" in decl:
+                        # RHS is everything between ``= `` and the
+                        # trailing ``;``. We strip both to get the
+                        # bare Pascal type name.
+                        rhs = decl.split("=", 1)[1].strip().rstrip(";").strip()
+                        # Only record simple typedefs — for
+                        # struct/enum/union the ``T<Name>`` itself
+                        # is the resolved type (used by later
+                        # pointer typedefs like ``PFoo = ^TFoo;``).
+                        if td.kind == "typedef":
+                            typedef_chain[td.name] = rhs
+                        else:
+                            typedef_chain[td.name] = _pascalize_type(td.name)
                 continue
             # Decl (global var or function prototype)
             if isinstance(ext, c_ast.Decl):

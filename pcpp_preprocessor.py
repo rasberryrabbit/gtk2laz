@@ -435,6 +435,108 @@ def _auto_platform() -> str:
     return "linux"
 
 
+# ----------------------------------------------------------------------
+# _pp_define_compat
+#
+# pcpp's ``Preprocessor.define()`` does NOT accept the
+# ``"NAME=BODY"`` / ``"NAME(args)=BODY"`` shorthand that uses ``=``
+# as a separator — it expects WHITESPACE between the macro name (or
+# argument list) and the replacement text. When the ``=`` form is
+# passed:
+#
+#   * For OBJECT-LIKE macros (``"NAME=BODY"``) pcpp sees the ``=`` as
+#     the second token (not whitespace, not ``(``), prints
+#     "Bad macro definition", and DOES NOT register the macro at
+#     all. The macro then remains undefined and pcpp passes it
+#     through verbatim into the preprocessed output. The downstream
+#     AST translator sees undefined GTK_ constants like
+#     ``GTK_RESPONSE_NONE`` and produces broken Pascal.
+#
+#   * For FUNCTION-LIKE macros (``"NAME(args)=BODY"``) pcpp
+#     successfully creates a macro, but the ``=`` becomes the FIRST
+#     token of the macro body. So ``"GTK_STATUSBAR(x)=((x))"`` ends
+#     up with body ``"=((x))"`` instead of ``"((x))"``. When the
+#     macro is later expanded, ``GTK_STATUSBAR(status_bar)`` becomes
+#     ``"=((status_bar))"`` — note the leading ``=`` — which is the
+#     exact bug we observed in progAVR.c / progP32.c (the conversion
+#     log showed ``gtk_statusbar_push(=((status_bar)), ...)``).
+#
+# This helper accepts BOTH the ``=`` shorthand and the standard
+# whitespace form and converts the ``=`` form to the whitespace form
+# before calling ``pp.define()``. It only converts the FIRST ``=``
+# that separates the macro name (or its argument list) from the
+# body — subsequent ``=`` inside the body (e.g.
+# ``"FOO bar=baz"``) is left untouched. Function-like macros are
+# handled by tracking parenthesis depth so the first ``=`` after
+# the closing ``)`` of the argument list is the one we replace.
+# ----------------------------------------------------------------------
+def _pp_define_compat(pp, definition: str) -> bool:
+    """Define a macro on ``pp`` accepting the ``NAME=BODY`` shorthand.
+
+    Returns ``True`` if the macro was defined, ``False`` otherwise.
+    """
+    if definition is None:
+        return False
+    s = definition.strip()
+    if not s:
+        return False
+    # Find the macro head: NAME or NAME(args)
+    i = 0
+    n = len(s)
+    while i < n and (s[i].isalnum() or s[i] == '_'):
+        i += 1
+    if i == 0:
+        # Not a valid macro name; let pcpp report the error.
+        try:
+            pp.define(definition)
+            return True
+        except Exception:
+            return False
+    # Skip whitespace between name and possible '('
+    j = i
+    while j < n and s[j].isspace():
+        j += 1
+    if j < n and s[j] == '(':
+        # Function-like macro — find matching ')'
+        depth = 0
+        k = j
+        while k < n:
+            if s[k] == '(':
+                depth += 1
+            elif s[k] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if depth != 0:
+            # Unbalanced — let pcpp report the error.
+            try:
+                pp.define(definition)
+                return True
+            except Exception:
+                return False
+        head = s[: k + 1]
+        rest = s[k + 1 :]
+    else:
+        head = s[:i]
+        rest = s[i:]
+    # rest now starts where the body should be. If the first
+    # non-whitespace character of rest is '=', that '=' is the
+    # pcpp-unsupported separator — replace it with a space. Any
+    # subsequent '=' belongs to the body and is left alone.
+    rest_stripped = rest.lstrip()
+    if rest_stripped.startswith('='):
+        # Replace ONLY this leading '=' with a space.
+        eq_pos = rest.index('=')
+        rest = rest[:eq_pos] + ' ' + rest[eq_pos + 1 :]
+    new_def = head + rest
+    try:
+        pp.define(new_def)
+        return True
+    except Exception:
+        return False
+
+
 def preprocess(c_path: str,
                fake_include_dir: str = "/tmp/fake_libc_include",
                extra_defines: Optional[list[str]] = None,
@@ -610,10 +712,7 @@ def preprocess(c_path: str,
               f"({len(platform_defines)} preset defines)",
               file=sys.stderr)
     for d in platform_defines:
-        try:
-            pp.define(d)
-        except Exception:
-            pass
+        _pp_define_compat(pp, d)
 
     # Define away GNU extensions that pycparser cannot parse.
     # Each define maps the macro to empty (or a safe replacement).
@@ -662,28 +761,29 @@ def preprocess(c_path: str,
         "EXTERN extern",
         "DLLEXPORT extern",
         "DLLIMPORT extern",
-        "WINAPI extern",
-        "STDCALL extern",
-        "CDECL extern",
-        "CALLBACK extern",
+        # NOTE: WINAPI, STDCALL, CALLBACK, CDECL are NOT defined here
+        # as ``extern``. These are CALLING CONVENTION keywords, not
+        # linkage specifiers. They are handled by ``_CALLCONV_MAP``
+        # below, which replaces them with Pascal-safe placeholders.
+        # Defining them as ``extern`` here would make pcpp expand
+        # ``WINAPI`` to ``extern``, which then appears in function-
+        # pointer typedefs like ``typedef RET (extern* NAME)(...)``
+        # and breaks pycparser. The user's code uses ``WINAPI`` as
+        # ``__stdcall`` (a calling convention), so we must preserve
+        # that meaning, not replace it with ``extern``.
         "IN ",
         "OUT ",
         "OPTIONAL ",
         "CONST const",
-        "__int64 long long",
-        "__int32 long",
-        "__int16 short",
-        "__int8 char",
-        "__uint64 unsigned long long",
-        "__uint32 unsigned long",
-        "__uint16 unsigned short",
-        "__uint8 unsigned char",
+        # NOTE: __int64, __int32, etc. are NOT defined here because
+        # pcpp has BUILT-IN defines for these MSVC types that expand
+        # ``__int64`` to ``long long``. We undefine those built-in
+        # defines below (see the ``pp.undef()`` loop) so our fake
+        # header typedefs like ``typedef long __int64;`` stay intact.
+        # Defining them here would conflict with the undef logic.
     ]
     for d in gnu_defines:
-        try:
-            pp.define(d)
-        except Exception:
-            pass
+        _pp_define_compat(pp, d)
 
     # Apply extra defines passed by the user via ``--define`` on the
     # gtk2laz CLI. These are stored in the module-level
@@ -695,20 +795,111 @@ def preprocess(c_path: str,
     all_extra = list(extra_defines or []) + list(_GLOBAL_EXTRA_DEFINES)
     if all_extra:
         for d in all_extra:
-            try:
-                pp.define(d)
-            except Exception:
-                pass
-    # Define ``wchar_t`` as a macro so pcpp expands it to ``int``
-    # when it encounters ``typedef wchar_t WCHAR;`` etc. in fake
-    # headers. Without this, pcpp passes ``wchar_t`` through as an
-    # undefined identifier, and pycparser (which doesn't have
-    # ``wchar_t`` as a built-in type) aborts with "Missing type in
-    # declaration".
-    try:
-        pp.define("wchar_t=int")
-    except Exception:
-        pass
+            _pp_define_compat(pp, d)
+    # NOTE: ``wchar_t`` is intentionally NOT defined as a pcpp macro.
+    # The fundamental-types block emitted by ``_read_all_fake_headers``
+    # contains ``typedef int wchar_t;`` and is prepended to every
+    # preprocessed text, so pycparser already sees ``wchar_t`` as an
+    # alias for ``int``. Defining ``wchar_t`` as a pcpp macro here
+    # would cause pcpp to expand the prepended ``typedef int wchar_t;``
+    # line in every cleaned fake header (e.g. ``windows.h.cleaned``)
+    # into the invalid declaration ``typedef int int;``, which then
+    # breaks the whole AST parse with "Invalid declaration" at
+    # windows.h:1:9. Keeping ``wchar_t`` as a typedef (not a macro)
+    # is the correct approach: pcpp passes it through verbatim, and
+    # pycparser resolves it via the typedef in the fundamental block.
+    # Auto-define GTK/Gdk constants that are commonly used but not
+    # in our fake headers. We scan the SOURCE FILE (before pcpp)
+    # for GTK_/GDK_ uppercase identifiers and define them as 0.
+    # pcpp then expands them to 0, so pycparser sees a numeric
+    # literal instead of an undefined identifier.
+    # We also define GTK cast macros (GTK_WINDOW, GTK_ENTRY, etc.)
+    # as identity macros so pcpp passes the argument through.
+    _gtk_constant_defines = [
+        # GTK response codes
+        "GTK_RESPONSE_NONE=0", "GTK_RESPONSE_REJECT=-1",
+        "GTK_RESPONSE_ACCEPT=-2", "GTK_RESPONSE_DELETE_EVENT=-3",
+        "GTK_RESPONSE_OK=-5", "GTK_RESPONSE_CANCEL=-6",
+        "GTK_RESPONSE_CLOSE=-7", "GTK_RESPONSE_YES=-8",
+        "GTK_RESPONSE_NO=-9", "GTK_RESPONSE_APPLY=-10",
+        "GTK_RESPONSE_HELP=-11",
+        # GTK file chooser actions
+        "GTK_FILE_CHOOSER_ACTION_OPEN=0",
+        "GTK_FILE_CHOOSER_ACTION_SAVE=1",
+        "GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER=2",
+        "GTK_FILE_CHOOSER_ACTION_CREATE_FOLDER=3",
+        # GTK cast macros (function-like → identity)
+        "GTK_WINDOW(x)=((x))",
+        "GTK_ENTRY(x)=((x))",
+        "GTK_DIALOG(x)=((x))",
+        "GTK_FILE_CHOOSER(x)=((x))",
+        "GTK_WIDGET(x)=((x))",
+        "GTK_BIN(x)=((x))",
+        "GTK_CONTAINER(x)=((x))",
+        "GTK_NOTEBOOK(x)=((x))",
+        "GTK_COMBO_BOX(x)=((x))",
+        "GTK_SPIN_BUTTON(x)=((x))",
+        "GTK_TREE_VIEW(x)=((x))",
+        "GTK_TEXT_VIEW(x)=((x))",
+        "GTK_TEXT_BUFFER(x)=((x))",
+        "GTK_TOGGLE_BUTTON(x)=((x))",
+        "GTK_STATUSBAR(x)=((x))",
+        "GTK_BUTTON(x)=((x))",
+        "GTK_LABEL(x)=((x))",
+        "GTK_TOOL_BUTTON(x)=((x))",
+        "GTK_TOOLBAR(x)=((x))",
+        "GTK_TREE_SELECTION(x)=((x))",
+        "GTK_TREE_MODEL(x)=((x))",
+        "GTK_TREE_STORE(x)=((x))",
+        "GTK_LIST_STORE(x)=((x))",
+        "GTK_ADJUSTMENT(x)=((x))",
+        "GTK_SCALE(x)=((x))",
+        "GTK_SCROLLBAR(x)=((x))",
+        "GTK_SCROLLED_WINDOW(x)=((x))",
+        "GTK_FRAME(x)=((x))",
+        "GTK_PANED(x)=((x))",
+        "GTK_BOX(x)=((x))",
+        "GTK_VBOX(x)=((x))",
+        "GTK_HBOX(x)=((x))",
+        "GTK_MENU(x)=((x))",
+        "GTK_MENU_BAR(x)=((x))",
+        "GTK_MENU_ITEM(x)=((x))",
+        "GTK_CHECK_MENU_ITEM(x)=((x))",
+        "GTK_RADIO_BUTTON(x)=((x))",
+        "GTK_CHECK_BUTTON(x)=((x))",
+        "GTK_DRAWING_AREA(x)=((x))",
+        "GTK_PROGRESS_BAR(x)=((x))",
+        "GTK_IMAGE(x)=((x))",
+        "GTK_CELL_RENDERER(x)=((x))",
+        "GTK_CELL_RENDERER_TEXT(x)=((x))",
+        "GTK_CELL_RENDERER_PIXBUF(x)=((x))",
+        "GTK_CELL_RENDERER_TOGGLE(x)=((x))",
+        "GTK_TREE_VIEW_COLUMN(x)=((x))",
+        "GTK_ENTRY_BUFFER(x)=((x))",
+        "GTK_TEXT_TAG(x)=((x))",
+        "GTK_TEXT_TAG_TABLE(x)=((x))",
+        "GTK_TEXT_MARK(x)=((x))",
+        "GTK_EDITABLE(x)=((x))",
+        "GTK_CELL_LAYOUT(x)=((x))",
+        "GTK_TREE_SORTABLE(x)=((x))",
+        "GTK_TREE_MODEL_FILTER(x)=((x))",
+        "GTK_WINDOW_TYPE_TOPLEVEL=0",
+        "GTK_WINDOW_TYPE_POPUP=1",
+        "GTK_SELECTION_SINGLE=0",
+        "GTK_SELECTION_MULTIPLE=1",
+        "GTK_SELECTION_NONE=2",
+        "GTK_SELECTION_BROWSE=3",
+        "GTK_SELECTION_EXTENDED=4",
+        # GDK constants
+        "GDK_ACTION_COPY=0",
+        "GDK_ACTION_MOVE=0",
+        "GDK_ACTION_LINK=0",
+        "GDK_ACTION_ASK=0",
+        "GDK_ACTION_PRIVATE=0",
+        "GDK_ACTION_ALL=0",
+    ]
+    for d in _gtk_constant_defines:
+        _pp_define_compat(pp, d)
     # Undefine pcpp's BUILT-IN MSVC type macros so they don't
     # interfere with our fake header typedefs. pcpp internally defines
     # ``__int64`` as ``long long``, ``__uint64`` as ``unsigned long
@@ -927,28 +1118,32 @@ def preprocess(c_path: str,
     # After replacing calling-convention keywords, struct fields like:
     #   void * (__GTK2LAZ_CALLCONV_cdecl * malloc) (size_t size);
     # need to be normalized so pycparser can parse them. pycparser
-    # cannot handle ``( TYPE * name)`` in struct fields — it needs
-    # ``(*name)``. We move the calling-convention placeholder out of
-    # the parenthesised function-pointer syntax and append it to the
-    # field name with a ``__callconv_`` prefix so the Pascal translator
-    # can recognise it later.
+    # cannot handle ``( TYPE * name)`` — it needs ``(*name)``.
+    # We move the calling-convention placeholder out of the
+    # parenthesised function-pointer syntax and append it to the
+    # field name with a ``__callconv_`` prefix so the Pascal
+    # translator can recognise it later.
     #   void * (__GTK2LAZ_CALLCONV_cdecl * malloc) (size_t size);
     # becomes:
     #   void * (*malloc__callconv_cdecl) (size_t size);
-    # pycparser sees ``malloc__callconv_cdecl`` as a valid identifier
-    # (field name), and the Pascal translator strips the
-    # ``__callconv_cdecl`` suffix and emits ``cdecl`` as a calling
-    # convention modifier on the procedure/function declaration.
+    # BUT: for typedef declarations like:
+    #   typedef void (__GTK2LAZ_CALLCONV_stdcall * GETHIDGUID) (LPGUID);
+    # we must NOT rename the typedef name — we just strip the
+    # placeholder so pycparser sees:
+    #   typedef void (*GETHIDGUID) (LPGUID);
+    # We detect typedefs vs struct fields by checking if the name
+    # is ALL UPPERCASE (typedef convention) vs mixed case (field).
     def _move_callconv(m):
         ret_type = m.group(1)
         callconv = m.group(2)
         name = m.group(3)
         params = m.group(4)
         if callconv:
-            # Extract just the convention name (e.g. ``cdecl`` from
-            # ``__GTK2LAZ_CALLCONV_cdecl``).
             conv_name = callconv.replace("__GTK2LAZ_CALLCONV_", "")
-            return f"{ret_type} (*{name}__callconv_{conv_name}) ({params})"
+            if name.isupper():
+                return f"{ret_type} (*{name}) ({params})"
+            else:
+                return f"{ret_type} (*{name}__callconv_{conv_name}) ({params})"
         return m.group(0)
 
     text = _re_mod.sub(
@@ -956,9 +1151,75 @@ def preprocess(c_path: str,
         _move_callconv,
         text,
     )
-    # Also normalize ``( * name)`` to ``(*name)`` (leftover spaces
-    # without calling-convention keywords).
+    # Also strip ``extern`` when it appears in function-pointer
+    # typedef syntax like ``typedef RET (extern* NAME)(PARAMS)``.
+    # This happens when ``WINAPI`` (defined as empty in fake
+    # windows.h) gets expanded by pcpp to ``extern`` for some
+    # reason. We strip ``extern`` only in the specific context of
+    # ``(extern*`` to avoid removing legitimate ``extern`` from
+    # variable declarations.
+    text = _re_mod.sub(r"\(\s*extern\s*\*", "(*", text)
     text = _re_mod.sub(r"\(\s*\*\s+(\w+)", r"(*\1", text)
+
+    # ---- Auto-define undefined GTK/Gdk constants.
+    #
+    # GTK applications use many enum/macro constants that are NOT
+    # types but values (GTK_RESPONSE_ACCEPT, GTK_FILE_CHOOSER_ACTION_SAVE,
+    # GTK_WINDOW, GTK_ENTRY, etc.). These are defined in real GTK
+    # headers via ``#define`` or ``enum``, but our fake headers only
+    # cover a subset. When pcpp doesn't have the ``#define``, it
+    # passes the identifier through unchanged, and pycparser sees an
+    # undefined identifier where it expects a value — causing
+    # "Invalid declaration" or "before: XXX" errors.
+    #
+    # We scan the pcpp output for ALL uppercase-initial identifiers
+    # that:
+    #   1. Start with ``GTK_`` or ``GDK_`` (GTK/GDK constant prefix)
+    #   2. Are NOT already defined as ``#define``, ``typedef``, or
+    #      ``enum`` in the text
+    #   3. Are NOT in the auto-inject candidates (those are types,
+    #      not values)
+    # and prepend ``#define NAME 0`` for each one. pycparser does
+    # NOT support ``#define`` in its input — but wait, it DOES
+    # support ``#define`` if it's a simple object-like macro? No,
+    # pycparser explicitly rejects ``#define``. So instead we
+    # prepend ``typedef int NAME;`` for each undefined constant.
+    # This makes pycparser treat the constant as a type name, which
+    # is wrong semantically but lets the parse succeed so we can
+    # extract function bodies. The pattern translator then sees
+    # the original source text (not the preprocessed text) and
+    # translates the constant correctly.
+    _defined_names: set[str] = set()
+    # Collect names already defined via typedef, enum, or #define
+    for m in _re_mod.finditer(
+        r"(?:typedef\s+\w[\w\s\*]*\s+(\w+)\s*[;{]"
+        r"|enum\s*\w*\s*\{([^}]*)\}"
+        r"|#define\s+(\w+))",
+        text,
+    ):
+        if m.group(1):
+            _defined_names.add(m.group(1))
+        if m.group(2):
+            for im in _re_mod.finditer(r"\b([A-Za-z_]\w*)\b", m.group(2)):
+                _defined_names.add(im.group(1))
+        if m.group(3):
+            _defined_names.add(m.group(3))
+    # Also add denylist names (they're known constants)
+    _defined_names.update(_NON_TYPE_DENYLIST)
+    # Scan for GTK_/GDK_ constants that are used but not defined
+    # in the pcpp output. These are constants that pcpp failed to
+    # expand (because our fake headers didn't have the #define).
+    # We replace each undefined constant with 0 so pycparser sees
+    # a numeric literal instead of an undefined identifier.
+    _const_seen: set[str] = set()
+    for m in _re_mod.finditer(r"\b(GTK_[A-Z][A-Z0-9_]+|GDK_[A-Z][A-Z0-9_]+)\b", text):
+        name = m.group(1)
+        if name in _defined_names or name in _const_seen:
+            continue
+        _const_seen.add(name)
+        # Replace the constant with 0 everywhere in the text.
+        # We use word-boundary replacement to avoid partial matches.
+        text = _re_mod.sub(rf"\b{re.escape(name)}\b", "0", text)
 
     # ---- Strip ``extern "C" { ... }`` blocks from the preprocessed text.
     #
@@ -1052,7 +1313,29 @@ def preprocess(c_path: str,
             continue
         cleaned_lines.append(line)
 
-    return "\n".join(cleaned_lines)
+    text = "\n".join(cleaned_lines)
+
+    # ---- Strip ALL comments from the final pcpp output.
+    #
+    # pycparser does NOT support comments in its input (it expects
+    # already-preprocessed text). It will abort with
+    # ``"Comments are not supported"`` if it encounters ``/* ... */``
+    # or ``//`` comments. Even though our ``on_file_open`` override
+    # strips comments from fake-header files, pcpp may still pass
+    # through comments from:
+    #   * The user's source file (which we DON'T strip in on_file_open
+    #     — only fake headers get stripped).
+    #   * pcpp's own passthru mode for unrecognized directives.
+    #   * The fake header blob (from _read_all_fake_headers) which
+    #     we prepend to the text.
+    # We strip ALL comments here as a final safety net so pycparser
+    # always sees comment-free text.
+    # Strip block comments (/* ... */) — non-greedy, multiline.
+    text = _re_mod.sub(r"/\*.*?\*/", " ", text, flags=_re_mod.S)
+    # Strip line comments (// ... to end of line).
+    text = _re_mod.sub(r"//[^\n]*", "", text)
+
+    return text
 
 
 def _strip_extern_c_blocks(text: str) -> str:
@@ -2661,6 +2944,11 @@ def _read_all_fake_headers(fake_include_dir: str) -> str:
         # Emit a #line directive so pycparser attributes all nodes
         # from this header to "<header_name>" coord.file.
         out_parts.append(f'#line 1 "{header_name}"')
+        # Strip comments FIRST (before stripping # directives, so a
+        # ``#`` inside a comment is not mistaken for a directive).
+        # pycparser does NOT support comments in its input.
+        content = _re_mod.sub(r"/\*.*?\*/", " ", content, flags=_re_mod.S)
+        content = _re_mod.sub(r"//[^\n]*", "", content)
         # Strip every # directive EXCEPT the #line we just emitted.
         # We do this by processing each line of the header's content:
         # any line starting with ``#`` that is NOT a ``#line`` we
