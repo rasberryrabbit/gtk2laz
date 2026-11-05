@@ -406,6 +406,15 @@ C_TYPE_MAP = {
     "gint8":          "ShortInt",
     "gint64":         "Int64",
     "guint64":        "QWord",
+    # MSVC fixed-width integer types
+    "__int64":        "Int64",
+    "__int32":        "LongInt",
+    "__int16":        "SmallInt",
+    "__int8":         "ShortInt",
+    "__uint64":       "QWord",
+    "__uint32":       "LongWord",
+    "__uint16":       "Word",
+    "__uint8":        "Byte",
     "FILE":           "TextFile",
     "GtkWidget":      "TControl",   # generic fallback
     "GtkWindow":      "TForm",

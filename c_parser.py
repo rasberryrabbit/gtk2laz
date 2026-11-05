@@ -1117,6 +1117,7 @@ _KNOWN_TYPEDEFS = {
     "HIDD_ATTRIBUTES", "PHIDD_ATTRIBUTES",
     "OVERLAPPED", "LPOVERLAPPED",
     "HDEVINFO", "PCSTR", "PCWSTR", "PULONG",
+    "WSADATA", "LPWSADATA", "WSABUF", "LPWSABUF",
     "fd_set", "ssize_t",
     # GtkTreeModel and related (used in opgui.c)
     "GtkTreeModel", "GtkTreeSelection", "GtkCellRendererText",
@@ -4404,6 +4405,17 @@ class BodyTranslator:
         # ---- Identifier name remapping ----
         if re.match(r"^\w+$", expr) and expr in self._name_map:
             return self._name_map[expr]
+        # ---- Calling convention placeholders ----
+        # ``__GTK2LAZ_CALLCONV_cdecl`` etc. are placeholders inserted
+        # by pcpp_preprocessor.preprocess() to preserve the C calling
+        # convention through pycparser (which doesn't know ``__cdecl``).
+        # In expression context these placeholders are meaningless —
+        # they only matter in function/procedure declarations, which
+        # are handled by the signature translator.  In expressions
+        # we just strip them (they appear as type qualifiers that
+        # Pascal doesn't need in expression position).
+        if expr.startswith("__GTK2LAZ_CALLCONV_"):
+            return ""
         # ---- Logical operators (&&, ||) — wrap each side in parens ----
         # Pascal's ``and``/``or`` are bitwise by default and have higher
         # precedence than comparison operators (unlike C, where ``&&`` has
@@ -6983,19 +6995,25 @@ class HeaderTranslator:
                 continue
 
             # ---- Function pointer fields ----
-            # C pattern: ``RET_TYPE (CALLBACK * NAME)(PARAMS)``
-            # e.g. ``void * (ENET_CALLBACK * malloc)(size_t size)``
-            # Pascal: function pointer → procedural type
-            # e.g. ``malloc: function(size: PtrUInt): Pointer``
+            # C pattern: ``RET_TYPE (* NAME)(PARAMS)``
+            # The calling convention is encoded in the field name as
+            # a ``__callconv_<conv>`` suffix (e.g. ``malloc__callconv_cdecl``).
+            # This was inserted by pcpp_preprocessor.preprocess() to
+            # preserve the calling convention through pycparser.
+            # Pascal: function pointer → procedural type with calling
+            # convention modifier.
+            # e.g. ``malloc: function(size: PtrUInt): Pointer; cdecl``
             m_fp = re.match(
                 r"^(?P<ret_type>[\w\s\*]+?)\s*"
-                r"\(\s*\w*\s*\*\s*(?P<name>\w+)\s*\)"
+                r"\(\s*\*\s*(?P<name>\w+)(__callconv_(?P<callconv>\w+))?\s*\)"
                 r"\s*\(\s*(?P<params>.*?)\s*\)\s*$",
                 decl, re.DOTALL,
             )
             if m_fp:
                 ret_type = m_fp.group("ret_type").strip()
+                # Strip the __callconv_ suffix from the field name
                 name = m_fp.group("name")
+                callconv = m_fp.group("callconv") or ""
                 params_raw = m_fp.group("params").strip()
                 # Convert return type
                 pas_ret = c_type_to_pascal(ret_type)
@@ -7026,11 +7044,14 @@ class HeaderTranslator:
                 # C ``void`` return → Pascal ``procedure`` (no return).
                 # C ``void *`` return → Pascal ``function(...): Pointer``.
                 # C ``int`` return → Pascal ``function(...): Integer``.
+                # Calling convention (cdecl, stdcall, etc.) is appended
+                # after the declaration so Pascal knows how to call it.
+                callconv_suffix = f" {callconv}" if callconv else ""
                 if ret_type.strip() == "void":
-                    field_type = f"procedure({pas_params})"
+                    field_type = f"procedure({pas_params}){callconv_suffix}"
                 else:
                     pas_ret = c_type_to_pascal(ret_type)
-                    field_type = f"function({pas_params}): {pas_ret}"
+                    field_type = f"function({pas_params}): {pas_ret}{callconv_suffix}"
                 out.append((name, field_type))
                 continue
 
@@ -7568,17 +7589,13 @@ def _ensure_fake_includes() -> str:
         return _FAKE_INCLUDE_DIR
     # ALWAYS regenerate the on-disk fake headers. We used to check for
     # a sentinel file (gtk/gtk.h) and skip regeneration if it existed,
-    # but that caused a critical bug on Windows: if the user previously
-    # ran an older version of gtk2laz, the stale on-disk headers would
-    # have been written with \\r\\n line endings (because the old code
-    # used ``open(path, "w")`` without ``newline=""``). pcpp would then
-    # read those \\r\\n files when resolving ``#include <windows.h>``
-    # and pass the \\r characters through to pycparser, which rejects
-    # \\r with "Illegal character '\\r'" or "Invalid declaration".
-    # By always regenerating, we ensure the on-disk files are always
-    # written with LF-only line endings (gen_fake_includes.py now uses
-    # ``newline=""``), regardless of what a previous version left
-    # behind.
+    # but that caused a critical bug: stale on-disk headers from an
+    # older version (with \\r\\n line endings or ``long long`` typedefs)
+    # would be read by pcpp and passed to pycparser, causing "Invalid
+    # declaration" or "Illegal character" errors. By always
+    # regenerating, we ensure the on-disk files always match the
+    # current gen_fake_includes.py (which uses ``newline=""`` and
+    # ``long`` instead of ``long long``).
     # Generate by importing the gen_fake_includes module (works both in
     # source layout and under PyInstaller, since gen_fake_includes.py is
     # bundled as a data file).

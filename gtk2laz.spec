@@ -13,9 +13,6 @@ Builds a single-file executable that bundles:
 
 The resulting binary is a console application: it prints help on `--help`
 and launches the GUI on `gtk2laz gui`.
-
-Requirements (must be installed before building):
-  pip install pyinstaller pycparser ply pcpp
 """
 
 import os

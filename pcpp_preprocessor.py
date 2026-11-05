@@ -281,6 +281,76 @@ class FakeIncludePreprocessor(Preprocessor):
         # WARNING above and can investigate.
         raise OutputDirective(Action.IgnoreAndRemove)
 
+    def on_file_open(self, is_system_include, fulliname):
+        """Override pcpp's default file-open to return a CLEANED
+        version of fake-header files.
+
+        pcpp finds fake-header files directly (via ``add_path``) and
+        calls ``on_file_open`` to read them. The default implementation
+        just does ``open(fulliname, 'r')``. We override it to:
+          * Check if the file is inside our fake-include directory.
+          * If so, return a cleaned version (with # directives and
+            comments stripped, LF-only line endings).
+          * Otherwise, return the original file unchanged.
+        """
+        try:
+            real_fake = os.path.abspath(self.fake_dir)
+            real_file = os.path.abspath(fulliname)
+            if real_file.startswith(real_fake):
+                cleaned = self._get_cleaned_fake_header(fulliname)
+                return open(cleaned, "r", encoding="utf-8",
+                           errors="replace", newline="")
+        except Exception:
+            pass
+        return open(fulliname, "r", encoding="utf-8", errors="replace")
+
+    def _get_cleaned_fake_header(self, path):
+        """Return a path to a cleaned version of the fake header at
+        ``path`` with all preprocessor directives AND comments stripped.
+        """
+        if not hasattr(self, "_cleaned_header_cache"):
+            self._cleaned_header_cache = {}
+        if path in self._cleaned_header_cache:
+            return self._cleaned_header_cache[path]
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace",
+                      newline="") as f:
+                content = f.read()
+        except OSError:
+            return path
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
+        # Strip comments
+        content = _re_mod.sub(r"/\*.*?\*/", " ", content, flags=_re_mod.S)
+        content = _re_mod.sub(r"//[^\n]*", "", content)
+        # Strip # directives
+        cleaned_lines = []
+        for line in content.splitlines():
+            if line.lstrip().startswith("#"):
+                cleaned_lines.append("")
+            else:
+                cleaned_lines.append(line)
+        cleaned_content = "\n".join(cleaned_lines)
+        # Prepend fundamental typedefs that the cleaned file might
+        # need but that were defined in OTHER fake headers (and thus
+        # were stripped from THIS file's content). The most common
+        # case is ``wchar_t`` — windows.h uses it but doesn't define
+        # it (it's in wchar.h). pcpp reads the cleaned on-disk file
+        # directly, so wchar.h's typedef is not in scope.
+        # We check if the file uses ``wchar_t`` and, if so, prepend
+        # the typedef. This is the same approach as the
+        # ``_fundamental`` block in ``_read_all_fake_headers``.
+        if "wchar_t" in cleaned_content and \
+                "typedef int wchar_t;" not in cleaned_content:
+            cleaned_content = "typedef int wchar_t;\n" + cleaned_content
+        cleaned_path = path + ".cleaned"
+        try:
+            with open(cleaned_path, "w", encoding="utf-8", newline="") as f:
+                f.write(cleaned_content)
+        except OSError:
+            return path
+        self._cleaned_header_cache[path] = cleaned_path
+        return cleaned_path
+
     def on_error(self, source, lineno, msg):
         """Collect errors instead of printing them. We don't want pcpp
         to abort on missing headers (we handle that in
@@ -629,6 +699,34 @@ def preprocess(c_path: str,
                 pp.define(d)
             except Exception:
                 pass
+    # Define ``wchar_t`` as a macro so pcpp expands it to ``int``
+    # when it encounters ``typedef wchar_t WCHAR;`` etc. in fake
+    # headers. Without this, pcpp passes ``wchar_t`` through as an
+    # undefined identifier, and pycparser (which doesn't have
+    # ``wchar_t`` as a built-in type) aborts with "Missing type in
+    # declaration".
+    try:
+        pp.define("wchar_t=int")
+    except Exception:
+        pass
+    # Undefine pcpp's BUILT-IN MSVC type macros so they don't
+    # interfere with our fake header typedefs. pcpp internally defines
+    # ``__int64`` as ``long long``, ``__uint64`` as ``unsigned long
+    # long``, etc. (matching MSVC's compiler built-in types). When our
+    # fake ``windows.h`` writes ``typedef long __int64;``, pcpp
+    # expands ``__int64`` to ``long long``, producing the INVALID
+    # declaration ``typedef long long long;``. pycparser rejects this
+    # with "Invalid declaration" and the whole AST parse fails.
+    # By undefining these built-in macros, we ensure pcpp passes
+    # ``__int64`` through as an ordinary identifier, so our typedef
+    # ``typedef long __int64;`` stays intact and pycparser parses it
+    # correctly.
+    for msvc_type in ("__int64", "__int32", "__int16", "__int8",
+                      "__uint64", "__uint32", "__uint16", "__uint8"):
+        try:
+            pp.undef(msvc_type)
+        except Exception:
+            pass
 
     # Add search paths so pcpp can resolve includes directly (in
     # addition to our on_include_not_found callback). We add BOTH the
@@ -685,26 +783,6 @@ def preprocess(c_path: str,
     out = io.StringIO()
     pp.write(out)
     text = out.getvalue()
-
-    # ---- Strip \\r characters from the pcpp output.
-    #
-    # On Windows, the on-disk fake headers (in
-    # ``%TEMP%\\fake_libc_include\\``) may have been written with
-    # \\r\\n line endings — either by an older version of
-    # gen_fake_includes.py (which used ``open(path, "w")`` without
-    # ``newline=""``) or by the current version if the user's Python
-    # installation has unusual defaults. When pcpp reads those files
-    # (via our ``on_include_not_found`` callback which returns the
-    # full path), it passes the \\r characters through to its output.
-    # pycparser then rejects \\r with ``"Illegal character '\\r'"`` or
-    # ``"Invalid declaration"``, causing the ENTIRE AST parse to fail
-    # on every file that includes a system header.
-    #
-    # We strip \\r here (converting \\r\\n to \\n, and standalone \\r
-    # to \\n) so pycparser always sees clean LF-only text regardless
-    # of the host platform or the on-disk file's line endings.
-    if "\r" in text:
-        text = text.replace("\r\n", "\n").replace("\r", "\n")
 
     # ---- Auto-inject fake GTK/GDK header if the preprocessed text
     # references GTK/GDK types but the source did not include <gtk/gtk.h>
@@ -771,6 +849,117 @@ def preprocess(c_path: str,
     # can extract all function bodies.
     text = _inject_missing_gtk_typedefs(text)
 
+    # ---- Replace calling-convention keywords with Pascal-safe placeholders.
+    #
+    # When pcpp expands calling-convention macros like ``__cdecl``,
+    # ``__stdcall``, ``WINAPI``, ``CALLBACK``, etc., they end up in
+    # struct field declarations and function prototypes like:
+    #   void * (__cdecl * malloc) (size_t size);
+    #   int __stdcall foo(int a);
+    # pycparser doesn't know ``__cdecl`` (it's a compiler extension)
+    # and aborts with ``"before: *"``.
+    #
+    # We DON'T just strip these keywords — the calling convention is
+    # important for Pascal: ``__cdecl`` maps to ``cdecl``, ``__stdcall``
+    # maps to ``stdcall``, etc. These must appear as modifiers on
+    # procedure/function declarations in the generated Pascal code.
+    #
+    # Instead, we replace each calling-convention keyword with a
+    # placeholder typedef name that pycparser CAN parse (it just treats
+    # it as an identifier), but that the Pascal translator can later
+    # recognize and convert to the appropriate Pascal modifier.
+    #
+    # The placeholder format is ``__GTK2LAZ_CALLCONV_<NAME>`` where
+    # <NAME> is the convention name (e.g. ``cdecl``, ``stdcall``).
+    # For example:
+    #   void * (__cdecl * malloc) (size_t size);
+    # becomes:
+    #   void * (__GTK2LAZ_CALLCONV_cdecl * malloc) (size_t size);
+    # pycparser sees ``__GTK2LAZ_CALLCONV_cdecl`` as an identifier and
+    # parses the function-pointer field correctly. The Pascal
+    # translator then recognizes the placeholder and emits ``cdecl``
+    # in the Pascal procedure declaration.
+    _CALLCONV_MAP = {
+        "__cdecl":       "__GTK2LAZ_CALLCONV_cdecl",
+        "__stdcall":     "__GTK2LAZ_CALLCONV_stdcall",
+        "__fastcall":    "__GTK2LAZ_CALLCONV_fastcall",
+        "__vectorcall":  "__GTK2LAZ_CALLCONV_vectorcall",
+        "__thiscall":    "__GTK2LAZ_CALLCONV_thiscall",
+        "__clrcall":     "__GTK2LAZ_CALLCONV_clrcall",
+        "__syscall":     "__GTK2LAZ_CALLCONV_syscall",
+        "WINAPI":        "__GTK2LAZ_CALLCONV_stdcall",
+        "CALLBACK":      "__GTK2LAZ_CALLCONV_stdcall",
+        "APIENTRY":      "__GTK2LAZ_CALLCONV_stdcall",
+        "APIPRIVATE":    "__GTK2LAZ_CALLCONV_stdcall",
+        "WINAPIV":       "__GTK2LAZ_CALLCONV_cdecl",
+        "WSAAPI":        "__GTK2LAZ_CALLCONV_cdecl",
+        "PASCAL":        "__GTK2LAZ_CALLCONV_stdcall",
+        "FAR":           "",
+        "NEAR":          "",
+    }
+    for kw, placeholder in _CALLCONV_MAP.items():
+        if placeholder:
+            text = text.replace(kw, placeholder)
+        else:
+            # FAR and NEAR are just empty qualifiers — strip them.
+            text = text.replace(kw, "")
+    # Define each placeholder as a typedef so pycparser treats it as
+    # a known type name (not an undefined identifier). We use ``int``
+    # as the placeholder type — the actual type doesn't matter for
+    # pycparser; it just needs to resolve the name.
+    _callconv_typedefs = set(_CALLCONV_MAP.values())
+    _callconv_typedefs.discard("")  # remove the empty string
+    _callconv_typedef_decl = "\n".join(
+        f"typedef int {ph};" for ph in sorted(_callconv_typedefs)
+    )
+    if _callconv_typedef_decl:
+        text = _callconv_typedef_decl + "\n" + text
+    # Ensure ``wchar_t`` is defined before any header content that
+    # uses it (e.g. windows.h's ``typedef wchar_t WCHAR;``).
+    # pcpp may include windows.h before wchar.h, causing pycparser to
+    # abort with "Missing type in declaration" on the ``wchar_t``
+    # reference, which cascades into "Invalid declaration" errors on
+    # every subsequent line. We prepend a ``typedef int wchar_t;``
+    # only if it's not already defined in the text.
+    if "wchar_t" in text and "typedef int wchar_t;" not in text:
+        text = "typedef int wchar_t;\n" + text
+    # Normalize function-pointer field declarations.
+    # After replacing calling-convention keywords, struct fields like:
+    #   void * (__GTK2LAZ_CALLCONV_cdecl * malloc) (size_t size);
+    # need to be normalized so pycparser can parse them. pycparser
+    # cannot handle ``( TYPE * name)`` in struct fields — it needs
+    # ``(*name)``. We move the calling-convention placeholder out of
+    # the parenthesised function-pointer syntax and append it to the
+    # field name with a ``__callconv_`` prefix so the Pascal translator
+    # can recognise it later.
+    #   void * (__GTK2LAZ_CALLCONV_cdecl * malloc) (size_t size);
+    # becomes:
+    #   void * (*malloc__callconv_cdecl) (size_t size);
+    # pycparser sees ``malloc__callconv_cdecl`` as a valid identifier
+    # (field name), and the Pascal translator strips the
+    # ``__callconv_cdecl`` suffix and emits ``cdecl`` as a calling
+    # convention modifier on the procedure/function declaration.
+    def _move_callconv(m):
+        ret_type = m.group(1)
+        callconv = m.group(2)
+        name = m.group(3)
+        params = m.group(4)
+        if callconv:
+            # Extract just the convention name (e.g. ``cdecl`` from
+            # ``__GTK2LAZ_CALLCONV_cdecl``).
+            conv_name = callconv.replace("__GTK2LAZ_CALLCONV_", "")
+            return f"{ret_type} (*{name}__callconv_{conv_name}) ({params})"
+        return m.group(0)
+
+    text = _re_mod.sub(
+        r"([\w\s\*]+?)\s*\(\s*(__GTK2LAZ_CALLCONV_\w+)\s*\*\s*(\w+)\s*\)\s*\(\s*(.*?)\s*\)",
+        _move_callconv,
+        text,
+    )
+    # Also normalize ``( * name)`` to ``(*name)`` (leftover spaces
+    # without calling-convention keywords).
+    text = _re_mod.sub(r"\(\s*\*\s+(\w+)", r"(*\1", text)
+
     # ---- Strip ``extern "C" { ... }`` blocks from the preprocessed text.
     #
     # C library headers (enet's enet.h, callbacks.h, list.h, and many
@@ -818,6 +1007,37 @@ def preprocess(c_path: str,
     # This is safe because ``extern "C" { ... }`` is purely a linkage
     # specifier — removing it has no effect on the declarations inside.
     text = _strip_extern_c_blocks(text)
+
+    # ---- Strip ``extern "C"`` linkage specifiers from single declarations.
+    #
+    # ``_strip_extern_c_blocks`` handles the block form
+    # ``extern "C" { ... }``, but there's also the single-declaration
+    # form:
+    #   extern "C" __declspec(dllimport) int AddInt(int a, int b);
+    #   extern "C" __declspec(dllexport) int AddInt(int a, int b);
+    # These appear in MSVC-style headers that mark individual functions
+    # for DLL import/export with C linkage. pycparser (a C parser)
+    # cannot handle ``extern "C"`` or ``__declspec(...)`` and aborts.
+    #
+    # We strip BOTH ``extern "C"`` and ``__declspec(...)`` from the
+    # text so pycparser sees a clean declaration:
+    #   int AddInt(int a, int b);
+    # The DLL import/export information is NOT preserved in the Pascal
+    # output (it's a Windows linker directive, not a type or calling
+    # convention). If the user needs ``external`` in Pascal, they can
+    # add it manually after conversion.
+    # Strip ``extern "C"`` (with or without quotes, with or without
+    # trailing ``{``).
+    text = _re_mod.sub(r'extern\s+"C"\s*', '', text)
+    text = _re_mod.sub(r"extern\s+'C'\s*", '', text)
+    # Strip ``__declspec(...)`` (with any content inside parens).
+    # This is non-greedy to handle multiple __declspec on the same
+    # line (rare but possible).
+    text = _re_mod.sub(r'__declspec\s*\([^)]*\)\s*', '', text)
+    # Also strip bare ``dllimport`` / ``dllexport`` keywords that
+    # might survive if __declspec was defined as a macro.
+    text = _re_mod.sub(r'\bdllexport\s*', '', text)
+    text = _re_mod.sub(r'\bdllimport\s*', '', text)
 
     # pcpp emits #line directives (since we set line_directive = "#line").
     # pycparser understands #line directives and uses them to set coord.file
@@ -1416,85 +1636,14 @@ def _iter_top_level_decls(text: str):
                 if next_ch in {"=", "[", ",", "(", "*"}:
                     i += 1
                     continue
-                # If the next char is an identifier character, it
-                # could be either:
-                #   (a) a declarator continuing the struct/union/enum
-                #       declaration (e.g. ``struct Foo { ... } var;`` or
-                #       ``struct Foo { ... } *ptr;``), OR
-                #   (b) a new declaration starting after a function
-                #       definition (e.g. ``void f() { ... } int bar;``).
-                # We distinguish these by reading the full identifier
-                # and checking if it is a C storage/type keyword.  If
-                # it IS a keyword (int, void, char, struct, extern,
-                # static, etc.), the ``}`` terminates a function
-                # definition and the identifier starts a new
-                # declaration.  If it is NOT a keyword, it's a
-                # declarator name continuing the current declaration.
+                # If the next char is an identifier character, the
+                # declarator continues (e.g. ``struct Foo { ... } var;``
+                # or ``struct Foo { ... } *ptr;``).  We do NOT yield.
                 if next_ch.isalpha() or next_ch == "_":
-                    # Read the full identifier starting at j.
-                    k = j
-                    while k < n and (text[k].isalnum() or text[k] == "_"):
-                        k += 1
-                    ident = text[j:k]
-                    # C storage-class and type keywords that can start
-                    # a new top-level declaration.  If the identifier
-                    # is one of these, the ``}`` terminates the
-                    # current declaration (function definition or
-                    # struct/union/enum with body).
-                    _C_DECL_START_KEYWORDS = {
-                        "int", "char", "short", "long", "float",
-                        "double", "void", "unsigned", "signed",
-                        "struct", "union", "enum",
-                        "extern", "static", "auto", "register",
-                        "volatile", "const",
-                        "typedef",
-                        # Common typedef'd types from our fake headers
-                        # that appear at the start of declarations.  We
-                        # include these so a function definition
-                        # followed by ``GtkWidget *foo;`` (which starts
-                        # with the typedef name ``GtkWidget``) is
-                        # correctly split.  This is conservative — if
-                        # we miss a typedef name, the worst case is
-                        # that two decls are merged into one (which
-                        # Pass 5/7 can still handle).
-                        "size_t", "ssize_t", "gboolean",
-                        "GtkWidget", "GtkWindow", "GObject", "GList",
-                        "DWORD", "HANDLE", "HWND", "HMODULE", "HDC",
-                        "BOOL", "BYTE", "WORD", "ULONG", "LONG",
-                        "INT", "UINT", "FILE",
-                        # ``inline`` and ``restrict`` can also start
-                        # a declaration in C99.
-                        "inline", "restrict",
-                    }
-                    if ident in _C_DECL_START_KEYWORDS:
-                        # The identifier is a C keyword — this ``}``
-                        # terminates a function definition.  Yield it.
-                        yield text[start:i + 1]
-                        start = i + 1
-                        i += 1
-                        continue
-                    # Not a keyword — the declarator continues
-                    # (e.g. ``struct Foo { ... } var;``).
                     i += 1
                     continue
-                # If the next char is ``;``, this ``}`` is the end of
-                # a struct/union/enum tag declaration
-                # (``struct Foo { ... };``) or a function definition
-                # (``void f() { ... };`` — rare but valid C).  In this
-                # case we do NOT yield at the ``}`` — we let the ``;``
-                # yield the declaration, so the ``;`` is included in
-                # the yielded text.  This avoids splitting
-                # ``struct Foo { ... };`` into two decls
-                # (``struct Foo { ... }`` + ``;``).
-                if next_ch == ";":
-                    i += 1
-                    continue
-                # Otherwise (``}`` (another function/struct following),
-                # EOF, or any other char), this ``}`` terminates the
-                # declaration.  Yield it.  This handles function
-                # definitions like ``void f() { ... }`` followed by
-                # another function ``void g() { ... }`` (no ``;``
-                # between them).
+                # Otherwise (``;``, ``}``, EOF, or any other char),
+                # this ``}`` terminates the declaration.  Yield it.
                 yield text[start:i + 1]
                 start = i + 1
             i += 1
@@ -1937,16 +2086,7 @@ def _inject_missing_gtk_typedefs(text: str) -> str:
         # We detect this by looking at the FIRST piece only (which
         # contains the struct/union/enum keyword and tag).
         if pieces:
-            # Strip trailing ``;`` from the first piece before
-            # tokenizing, so ``enum Color  ;`` (after brace stripping)
-            # becomes ``enum Color`` and has only 2 tokens.  Without
-            # this strip, the ``;`` would be counted as a third
-            # token, making ``has_var`` incorrectly True, and the
-            # tag ``Color`` would be added to ``already_defined``,
-            # suppressing the auto-inject that the user's source needs
-            # (e.g. ``Color c;`` without the ``enum`` prefix).
-            first_piece_clean = pieces[0].rstrip(";").strip()
-            first_piece_tokens = first_piece_clean.split()
+            first_piece_tokens = pieces[0].split()
             if (len(first_piece_tokens) >= 2
                     and first_piece_tokens[0] in ("struct", "union", "enum")
                     and first_piece_tokens[1] not in ("struct", "union", "enum")):
@@ -2508,15 +2648,8 @@ def _read_all_fake_headers(fake_include_dir: str) -> str:
                 fpath = os.path.join(root, fname)
                 try:
                     with open(fpath, "r", encoding="utf-8",
-                              errors="replace", newline="") as f:
+                              errors="replace") as f:
                         content = f.read()
-                    # Strip any stray \\r characters that might have
-                    # been written by an older version of
-                    # gen_fake_includes.py (which used the default
-                    # text-mode open() on Windows, converting \\n to
-                    # \\r\\n). pycparser rejects \\r with
-                    # "Illegal character '\\r'", so we must remove them.
-                    content = content.replace("\r\n", "\n").replace("\r", "\n")
                 except OSError:
                     continue
                 header_pairs.append((fname, content))
@@ -2557,4 +2690,15 @@ def _read_all_fake_headers(fake_include_dir: str) -> str:
         # remaining empty lines (between this header and the next)
         # are attributed to the sentinel, not to the current header.
         out_parts.append(f'#line 1 "<fake_header_end>"')
-    return "\n".join(out_parts)
+    # ---- Prepend fundamental typedefs that pycparser needs but might
+    # not have yet if the headers are out of order (e.g. windows.h
+    # uses ``wchar_t`` but wchar.h might not have been included yet).
+    # We emit these BEFORE any header content so they are always in
+    # scope. The #line sentinel ensures they are attributed to a
+    # non-user file and filtered out by the AST translator.
+    _fundamental = (
+        "#line 1 \"<fundamental_types>\"\n"
+        "typedef int wchar_t;\n"
+        "#line 1 \"<fake_header_end>\"\n"
+    )
+    return _fundamental + "\n".join(out_parts)

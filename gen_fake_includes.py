@@ -20,11 +20,11 @@ HEADERS = {
 typedef int int8_t;
 typedef int int16_t;
 typedef int int32_t;
-typedef long long int64_t;
+typedef long int64_t;
 typedef unsigned int uint8_t;
 typedef unsigned int uint16_t;
 typedef unsigned int uint32_t;
-typedef unsigned long long uint64_t;
+typedef unsigned long uint64_t;
 typedef unsigned long uintptr_t;
 typedef long intptr_t;
 #endif
@@ -340,8 +340,8 @@ typedef unsigned char guint8;
 typedef int gint32;
 typedef short gint16;
 typedef signed char gint8;
-typedef long long gint64;
-typedef unsigned long long guint64;
+typedef long gint64;
+typedef unsigned long guint64;
 typedef int GCallback;
 typedef void* GObject;
 #define G_CALLBACK(f) ((GCallback)(f))
@@ -475,8 +475,8 @@ typedef unsigned char guint8;
 typedef int gint32;
 typedef short gint16;
 typedef char gint8;
-typedef long long gint64;
-typedef unsigned long long guint64;
+typedef long gint64;
+typedef unsigned long guint64;
 #endif
 """,
     # ---- Minimal Windows / Winsock / MMSYSTEM stubs ----
@@ -517,8 +517,8 @@ typedef unsigned long  u_long;
 typedef unsigned short u_short;
 typedef unsigned int   u_int;
 typedef unsigned char  u_char;
-typedef long long      LARGE_INTEGER;
-typedef long long      ULARGE_INTEGER;
+typedef long      LARGE_INTEGER;
+typedef long      ULARGE_INTEGER;
 typedef int            BOOLEAN;
 typedef unsigned long  *PULONG;
 typedef unsigned long  *PDWORD;
@@ -532,11 +532,11 @@ typedef struct _GUID { unsigned long Data1; unsigned short Data2; unsigned short
 typedef const GUID   *LPCGUID;
 typedef struct _OVERLAPPED { DWORD Internal; DWORD InternalHigh; } OVERLAPPED, *LPOVERLAPPED;
 typedef struct _SECURITY_ATTRIBUTES { DWORD nLength; void *lpSecurityDescriptor; BOOL bInheritHandle; } LPSECURITY_ATTRIBUTES, *PSECURITY_ATTRIBUTES;
-typedef long long       __int64;
+typedef long       __int64;
 typedef long            __int32;
 typedef short           __int16;
 typedef char            __int8;
-typedef unsigned long long  __uint64;
+typedef unsigned long  __uint64;
 typedef unsigned long       __uint32;
 typedef unsigned short     __uint16;
 typedef unsigned char      __uint8;
@@ -742,15 +742,7 @@ def main(argv=None) -> int:
     for name, content in HEADERS.items():
         path = os.path.join(ROOT, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        # Use newline='' to force LF (\\n) line endings on ALL platforms.
-        # This is CRITICAL: pycparser rejects \\r characters with
-        # "Illegal character '\\r'". On Windows, the default text-mode
-        # open() converts \\n to \\r\\n, which would then cause pycparser
-        # to abort when reading the on-disk fake headers. By writing
-        # with newline='' (which preserves \\n as-is), we ensure the
-        # on-disk files are identical to the in-memory content and
-        # pycparser can parse them regardless of the host platform.
-        with open(path, "w", encoding="utf-8", newline="") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(content)
     print(f"Generated {len(HEADERS)} fake header files in {ROOT}")
     return 0
