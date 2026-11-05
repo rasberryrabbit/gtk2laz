@@ -686,6 +686,26 @@ def preprocess(c_path: str,
     pp.write(out)
     text = out.getvalue()
 
+    # ---- Strip \\r characters from the pcpp output.
+    #
+    # On Windows, the on-disk fake headers (in
+    # ``%TEMP%\\fake_libc_include\\``) may have been written with
+    # \\r\\n line endings — either by an older version of
+    # gen_fake_includes.py (which used ``open(path, "w")`` without
+    # ``newline=""``) or by the current version if the user's Python
+    # installation has unusual defaults. When pcpp reads those files
+    # (via our ``on_include_not_found`` callback which returns the
+    # full path), it passes the \\r characters through to its output.
+    # pycparser then rejects \\r with ``"Illegal character '\\r'"`` or
+    # ``"Invalid declaration"``, causing the ENTIRE AST parse to fail
+    # on every file that includes a system header.
+    #
+    # We strip \\r here (converting \\r\\n to \\n, and standalone \\r
+    # to \\n) so pycparser always sees clean LF-only text regardless
+    # of the host platform or the on-disk file's line endings.
+    if "\r" in text:
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+
     # ---- Auto-inject fake GTK/GDK header if the preprocessed text
     # references GTK/GDK types but the source did not include <gtk/gtk.h>
     # explicitly.  This is common in opgui: icd.h declares
@@ -1396,14 +1416,85 @@ def _iter_top_level_decls(text: str):
                 if next_ch in {"=", "[", ",", "(", "*"}:
                     i += 1
                     continue
-                # If the next char is an identifier character, the
-                # declarator continues (e.g. ``struct Foo { ... } var;``
-                # or ``struct Foo { ... } *ptr;``).  We do NOT yield.
+                # If the next char is an identifier character, it
+                # could be either:
+                #   (a) a declarator continuing the struct/union/enum
+                #       declaration (e.g. ``struct Foo { ... } var;`` or
+                #       ``struct Foo { ... } *ptr;``), OR
+                #   (b) a new declaration starting after a function
+                #       definition (e.g. ``void f() { ... } int bar;``).
+                # We distinguish these by reading the full identifier
+                # and checking if it is a C storage/type keyword.  If
+                # it IS a keyword (int, void, char, struct, extern,
+                # static, etc.), the ``}`` terminates a function
+                # definition and the identifier starts a new
+                # declaration.  If it is NOT a keyword, it's a
+                # declarator name continuing the current declaration.
                 if next_ch.isalpha() or next_ch == "_":
+                    # Read the full identifier starting at j.
+                    k = j
+                    while k < n and (text[k].isalnum() or text[k] == "_"):
+                        k += 1
+                    ident = text[j:k]
+                    # C storage-class and type keywords that can start
+                    # a new top-level declaration.  If the identifier
+                    # is one of these, the ``}`` terminates the
+                    # current declaration (function definition or
+                    # struct/union/enum with body).
+                    _C_DECL_START_KEYWORDS = {
+                        "int", "char", "short", "long", "float",
+                        "double", "void", "unsigned", "signed",
+                        "struct", "union", "enum",
+                        "extern", "static", "auto", "register",
+                        "volatile", "const",
+                        "typedef",
+                        # Common typedef'd types from our fake headers
+                        # that appear at the start of declarations.  We
+                        # include these so a function definition
+                        # followed by ``GtkWidget *foo;`` (which starts
+                        # with the typedef name ``GtkWidget``) is
+                        # correctly split.  This is conservative — if
+                        # we miss a typedef name, the worst case is
+                        # that two decls are merged into one (which
+                        # Pass 5/7 can still handle).
+                        "size_t", "ssize_t", "gboolean",
+                        "GtkWidget", "GtkWindow", "GObject", "GList",
+                        "DWORD", "HANDLE", "HWND", "HMODULE", "HDC",
+                        "BOOL", "BYTE", "WORD", "ULONG", "LONG",
+                        "INT", "UINT", "FILE",
+                        # ``inline`` and ``restrict`` can also start
+                        # a declaration in C99.
+                        "inline", "restrict",
+                    }
+                    if ident in _C_DECL_START_KEYWORDS:
+                        # The identifier is a C keyword — this ``}``
+                        # terminates a function definition.  Yield it.
+                        yield text[start:i + 1]
+                        start = i + 1
+                        i += 1
+                        continue
+                    # Not a keyword — the declarator continues
+                    # (e.g. ``struct Foo { ... } var;``).
                     i += 1
                     continue
-                # Otherwise (``;``, ``}``, EOF, or any other char),
-                # this ``}`` terminates the declaration.  Yield it.
+                # If the next char is ``;``, this ``}`` is the end of
+                # a struct/union/enum tag declaration
+                # (``struct Foo { ... };``) or a function definition
+                # (``void f() { ... };`` — rare but valid C).  In this
+                # case we do NOT yield at the ``}`` — we let the ``;``
+                # yield the declaration, so the ``;`` is included in
+                # the yielded text.  This avoids splitting
+                # ``struct Foo { ... };`` into two decls
+                # (``struct Foo { ... }`` + ``;``).
+                if next_ch == ";":
+                    i += 1
+                    continue
+                # Otherwise (``}`` (another function/struct following),
+                # EOF, or any other char), this ``}`` terminates the
+                # declaration.  Yield it.  This handles function
+                # definitions like ``void f() { ... }`` followed by
+                # another function ``void g() { ... }`` (no ``;``
+                # between them).
                 yield text[start:i + 1]
                 start = i + 1
             i += 1
@@ -1846,7 +1937,16 @@ def _inject_missing_gtk_typedefs(text: str) -> str:
         # We detect this by looking at the FIRST piece only (which
         # contains the struct/union/enum keyword and tag).
         if pieces:
-            first_piece_tokens = pieces[0].split()
+            # Strip trailing ``;`` from the first piece before
+            # tokenizing, so ``enum Color  ;`` (after brace stripping)
+            # becomes ``enum Color`` and has only 2 tokens.  Without
+            # this strip, the ``;`` would be counted as a third
+            # token, making ``has_var`` incorrectly True, and the
+            # tag ``Color`` would be added to ``already_defined``,
+            # suppressing the auto-inject that the user's source needs
+            # (e.g. ``Color c;`` without the ``enum`` prefix).
+            first_piece_clean = pieces[0].rstrip(";").strip()
+            first_piece_tokens = first_piece_clean.split()
             if (len(first_piece_tokens) >= 2
                     and first_piece_tokens[0] in ("struct", "union", "enum")
                     and first_piece_tokens[1] not in ("struct", "union", "enum")):
@@ -2408,8 +2508,15 @@ def _read_all_fake_headers(fake_include_dir: str) -> str:
                 fpath = os.path.join(root, fname)
                 try:
                     with open(fpath, "r", encoding="utf-8",
-                              errors="replace") as f:
+                              errors="replace", newline="") as f:
                         content = f.read()
+                    # Strip any stray \\r characters that might have
+                    # been written by an older version of
+                    # gen_fake_includes.py (which used the default
+                    # text-mode open() on Windows, converting \\n to
+                    # \\r\\n). pycparser rejects \\r with
+                    # "Illegal character '\\r'", so we must remove them.
+                    content = content.replace("\r\n", "\n").replace("\r", "\n")
                 except OSError:
                     continue
                 header_pairs.append((fname, content))

@@ -742,7 +742,15 @@ def main(argv=None) -> int:
     for name, content in HEADERS.items():
         path = os.path.join(ROOT, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
+        # Use newline='' to force LF (\\n) line endings on ALL platforms.
+        # This is CRITICAL: pycparser rejects \\r characters with
+        # "Illegal character '\\r'". On Windows, the default text-mode
+        # open() converts \\n to \\r\\n, which would then cause pycparser
+        # to abort when reading the on-disk fake headers. By writing
+        # with newline='' (which preserves \\n as-is), we ensure the
+        # on-disk files are identical to the in-memory content and
+        # pycparser can parse them regardless of the host platform.
+        with open(path, "w", encoding="utf-8", newline="") as f:
             f.write(content)
     print(f"Generated {len(HEADERS)} fake header files in {ROOT}")
     return 0

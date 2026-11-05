@@ -914,6 +914,15 @@ class AstToPascal:
         # names not covered by the fake headers still resolve to stubs.
         if text and _inject_missing_gtk_typedefs:
             text = _inject_missing_gtk_typedefs(text)
+        # ---- Final \\r stripping (Windows safety net) ---------------
+        # On Windows, the user's .c source files, the fake headers
+        # (if read from disk), and even pcpp's output may contain \\r
+        # characters. pycparser rejects \\r with "Illegal character
+        # '\\r'" or "Invalid declaration", causing the ENTIRE AST parse
+        # to fail on every file. We strip \\r here as a final safety
+        # net so pycparser always sees clean LF-only text.
+        if text and "\r" in text:
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
         # ---- Parse the preprocessed text with pycparser ----
         print(f"gtk2laz: [{_src_basename}] parsing with pycparser "
               f"({len(text) if text else 0} bytes)...", file=sys.stderr)

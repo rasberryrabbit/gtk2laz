@@ -15,17 +15,44 @@
 #   * the Tcl/Tk runtime libraries
 #
 # Requirements:
-#   pip install pyinstaller
+#   pip install pyinstaller pycparser ply pcpp
 #
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Ensure pyinstaller is available
-if ! command -v pyinstaller >/dev/null 2>&1; then
-    echo "PyInstaller not found. Installing..."
-    python3 -m pip install --user pyinstaller
+# Ensure all required packages are available.
+# The PyInstaller spec file (gtk2laz.spec) imports pycparser and pcpp
+# at spec-evaluation time, so they MUST be installed before building.
+# ply is required by pycparser for AST parsing.
+# pcpp is the pure-Python C preprocessor used for #include expansion.
+echo "Checking build dependencies..."
+MISSING=""
+python3 -c "import PyInstaller"  2>/dev/null || MISSING="$MISSING pyinstaller"
+python3 -c "import pycparser"    2>/dev/null || MISSING="$MISSING pycparser"
+python3 -c "import ply"          2>/dev/null || MISSING="$MISSING ply"
+python3 -c "import pcpp"         2>/dev/null || MISSING="$MISSING pcpp"
+if [ -n "$MISSING" ]; then
+    echo "Installing missing packages:$MISSING"
+    python3 -m pip install $MISSING
 fi
+
+# Verify ply is actually installed (critical for AST translation)
+echo "--- Verifying ply installation ---"
+python3 -c "import ply; import ply.lex; import ply.yacc; print('ply OK:', ply.__file__)" || {
+    echo "============================================================" >&2
+    echo "  ERROR: ply package is NOT installed!" >&2
+    echo "============================================================" >&2
+    echo "  ply is required for AST-based C parsing." >&2
+    echo "  Without it, you will get many more TODOs in the output." >&2
+    echo "" >&2
+    echo "  Install it manually:" >&2
+    echo "    pip install ply" >&2
+    echo "" >&2
+    echo "  Then re-run this script." >&2
+    echo "============================================================" >&2
+    exit 1
+}
 
 # Clean previous build artifacts
 rm -rf build dist

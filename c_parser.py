@@ -7566,19 +7566,19 @@ def _ensure_fake_includes() -> str:
     global _FAKE_INCLUDES_READY
     if _FAKE_INCLUDES_READY:
         return _FAKE_INCLUDE_DIR
-    # Check if the on-disk directory is already populated. We use a
-    # minimal sentinel (just gtk/gtk.h) here — we don't need to check
-    # for windows.h / winsock2.h / mmsystem.h any more because the
-    # in-memory dict (read by _read_all_fake_headers) is the
-    # authoritative source for the AST-parse blob. The on-disk files
-    # are only used as a fallback by pcpp's on_include_not_found, and
-    # for those includes the missing Windows headers will simply be
-    # passed through (which is fine — the AST blob already has the
-    # typedefs they need).
-    sentinel = os.path.join(_FAKE_INCLUDE_DIR, "gtk", "gtk.h")
-    if os.path.isfile(sentinel):
-        _FAKE_INCLUDES_READY = True
-        return _FAKE_INCLUDE_DIR
+    # ALWAYS regenerate the on-disk fake headers. We used to check for
+    # a sentinel file (gtk/gtk.h) and skip regeneration if it existed,
+    # but that caused a critical bug on Windows: if the user previously
+    # ran an older version of gtk2laz, the stale on-disk headers would
+    # have been written with \\r\\n line endings (because the old code
+    # used ``open(path, "w")`` without ``newline=""``). pcpp would then
+    # read those \\r\\n files when resolving ``#include <windows.h>``
+    # and pass the \\r characters through to pycparser, which rejects
+    # \\r with "Illegal character '\\r'" or "Invalid declaration".
+    # By always regenerating, we ensure the on-disk files are always
+    # written with LF-only line endings (gen_fake_includes.py now uses
+    # ``newline=""``), regardless of what a previous version left
+    # behind.
     # Generate by importing the gen_fake_includes module (works both in
     # source layout and under PyInstaller, since gen_fake_includes.py is
     # bundled as a data file).
