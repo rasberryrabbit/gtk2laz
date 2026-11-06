@@ -1415,6 +1415,9 @@ class CGlobal:
     type: str
     names: list[str]   # may include initializers like "x = 5"
     raw: str
+    init_text: str = ""  # raw initializer text (e.g. ``{ "..." }``),
+                         # recovered from the original source after
+                         # the brace-stripping pass.
 
 
 def extract_globals(residual: str) -> list[CGlobal]:
@@ -1427,7 +1430,12 @@ def extract_globals(residual: str) -> list[CGlobal]:
     an invalid Pascal type like ``Textern int``.
     """
     globals_list: list[CGlobal] = []
-    # Strip block contents that survived (struct/enum bodies)
+    # Strip block contents that survived (struct/enum bodies).
+    # We keep the ORIGINAL residual so we can recover initializers
+    # that the brace-stripping pass would lose. The ``init_text``
+    # field of each CGlobal is set to the raw initializer text
+    # (e.g. ``{ "..." }``) by scanning the original residual for
+    # ``varname = { ... }`` AFTER the regex match.
     cleaned = re.sub(r"\{[^{}]*\}", " ", residual)
     for m in _GLOBAL_VAR_RE.finditer(cleaned):
         type_str = m.group("type").strip()
@@ -1448,7 +1456,46 @@ def extract_globals(residual: str) -> list[CGlobal]:
         names = [p.strip() for p in parts if p.strip()]
         if not names:
             continue
-        globals_list.append(CGlobal(type=type_str, names=names, raw=m.group(0)))
+        # Recover the raw initializer text from the original residual
+        # for each declared variable. We look for ``varname = {...};``
+        # in the residual (the original, NOT the cleaned version).
+        # This is needed because the brace-stripping pass removed
+        # the ``{ ... }`` initializer from the cleaned text, so the
+        # regex above sees ``varname = ;`` instead of
+        # ``varname = { "..." };``. We use a brace-matching scan
+        # (not a regex) because the initializer can contain nested
+        # braces (e.g. for nested struct initializers).
+        init_text = ""
+        for name in names:
+            base_name = re.match(r"(\w+)", name)
+            if not base_name:
+                continue
+            var_name = base_name.group(1)
+            # Find ``var_name`` followed by ``= {`` in the residual.
+            # We use a simple regex with a lookahead for ``\s*=\s*{``.
+            im = re.search(
+                r'\b' + re.escape(var_name) + r'\s*=\s*\{',
+                residual,
+            )
+            if not im:
+                continue
+            # Walk forward from ``{`` to find the matching ``}``.
+            depth = 0
+            i = im.end() - 1  # position of the opening ``{``
+            j = i
+            while j < len(residual):
+                if residual[j] == '{':
+                    depth += 1
+                elif residual[j] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            if j < len(residual):
+                init_text = residual[im.end() - 1:j + 1]
+                break  # only one initializer per global; use the first
+        globals_list.append(CGlobal(type=type_str, names=names,
+                                    raw=m.group(0), init_text=init_text))
     return globals_list
 
 
@@ -5727,6 +5774,54 @@ class CFileTranslator:
         # the same as the unspaced forms, but our pattern matcher only
         # recognises the unspaced tokens.
         src_clean = _normalise_spaced_operators(src_clean)
+        # Strip ``__attribute__((...))`` GCC annotations so the
+        # pattern extractor's regex can match cleanly. Without this,
+        # ``const guint8 x[] __attribute__((aligned(4))) = { ... };``
+        # would not be matched as a single declaration because the
+        # regex doesn't understand ``__attribute__`` between the name
+        # and the ``=``. The AST path doesn't need this strip because
+        # pcpp's gnu_defines already expands ``__attribute__`` to
+        # nothing, but the pattern path sees the raw source text.
+        # We use a balanced-paren scan (not a regex) because
+        # ``__attribute__((aligned(4)))`` has nested parens that a
+        # regex can't reliably match. The function scans for
+        # ``__attribute__`` followed by ``(...)`` (with balanced
+        # parens) and replaces it with a space.
+        def _strip_attr(text):
+            out = []
+            i = 0
+            n = len(text)
+            while i < n:
+                # Look for ``__attribute__`` at position i.
+                if (text[i:i+13] == '__attribute__'
+                        and i + 13 < n):
+                    # Skip whitespace.
+                    j = i + 13
+                    while j < n and text[j].isspace():
+                        j += 1
+                    if j < n and text[j] == '(':
+                        # Walk to matching ``)`` (balanced parens).
+                        depth = 0
+                        k = j
+                        while k < n:
+                            if text[k] == '(':
+                                depth += 1
+                            elif text[k] == ')':
+                                depth -= 1
+                                if depth == 0:
+                                    break
+                            k += 1
+                        if k < n:
+                            # Skip ``__attribute__(...)`` — replace
+                            # with a space (preserves token
+                            # separation).
+                            out.append(' ')
+                            i = k + 1
+                            continue
+                out.append(text[i])
+                i += 1
+            return ''.join(out)
+        src_clean = _strip_attr(src_clean)
 
         # ---- Try AST-based analysis first ----
         if self.use_ast:
@@ -5942,7 +6037,26 @@ class CFileTranslator:
             out.append("var")
             seen_names: set[str] = set()
             for g in globals_list:
-                pas_type = c_type_to_pascal(g.type)
+                # Strip leading storage-class keywords (static, extern,
+                # const, volatile) from the type string. The pattern
+                # extractor's regex includes them in ``type``, but
+                # Pascal doesn't want them as part of the type name.
+                # Example: ``static const SECTION union`` → ``union``,
+                # ``static GStaticResource`` → ``GStaticResource``.
+                type_str = g.type
+                # Strip leading storage-class keywords one at a time.
+                while True:
+                    stripped = type_str.lstrip()
+                    parts = stripped.split(None, 1)
+                    if not parts:
+                        break
+                    if parts[0] in ('static', 'extern', 'const',
+                                    'volatile', 'register', 'auto',
+                                    'inline', 'restrict'):
+                        type_str = parts[1] if len(parts) > 1 else ''
+                        continue
+                    break
+                pas_type = c_type_to_pascal(type_str)
                 for name_init in g.names:
                     name, init = self._split_name_init(name_init)
                     if not name:
@@ -5954,6 +6068,39 @@ class CFileTranslator:
                     if base in seen_names:
                         continue
                     seen_names.add(base)
+                    # ---- Byte-array initializer support for the
+                    # pattern path. When the initializer looks like
+                    # a C byte-array initializer (a sequence of
+                    # string literals in braces), we expand it into
+                    # a Pascal typed array constant. This handles
+                    # ``const guint8 x[] = { "...", "..." };`` which
+                    # the pattern path encounters when the AST path
+                    # is unavailable (e.g. for icons.c if pycparser
+                    # fails).
+                    # We delegate to the AST translator's helper
+                    # since the byte parsing logic is the same.
+                    # We use ``g.init_text`` (recovered from the
+                    # original source via brace matching) because the
+                    # ``init`` from ``_split_name_init`` had its
+                    # braces stripped.
+                    raw_init = g.init_text or init
+                    if raw_init:
+                        # Try to convert C byte-array init to Pascal.
+                        from ast_translator import (
+                            _pattern_byte_array_init_to_pascal,
+                        )
+                        byte_init = _pattern_byte_array_init_to_pascal(raw_init)
+                        if byte_init is not None:
+                            n_bytes = byte_init.count('$')
+                            if pas_type in ('Byte', 'guint8',
+                                            'unsigned char'):
+                                emit_type = (f'array[0..{n_bytes}-1] '
+                                             f'of Byte')
+                            else:
+                                emit_type = pas_type
+                            out.append(f"  {pascalify_name(name)}: "
+                                        f"{emit_type} = {byte_init};")
+                            continue
                     if "[" in name:
                         m = re.match(r"(\w+)\s*\[([^\]]*)\]", name)
                         if m:

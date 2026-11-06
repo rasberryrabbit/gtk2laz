@@ -1,4 +1,4 @@
-gtk2laz v2.0 - Windows 설치 방법
+gtk2laz v2.2 - Windows 설치 방법
 ================================
 
 방법 1: Python 소스 직접 실행 (권장)
@@ -20,30 +20,24 @@ gtk2laz를 실행한 후, 결과 .pas 파일들을 FreePascal의
 {$IFDEF MSWINDOWS} / {$IFDEF UNIX} 블록으로 직접 병합해야 합니다.
 
 
-v2.0 변경 사항
+v2.2 변경 사항
 =============
-* C 언어 키워드와 C 표준 라이브러리 타입 별칭 분리 (사용자 제안)
-  - 기존: size_t, ssize_t, ptrdiff_t, wchar_t를 _C_TYPE_KEYWORDS로
-    잘못 분류 (C 언어 키워드가 아님!)
-  - 이제: _C_TYPE_KEYWORDS는 진짜 언어 키워드만 (int, void, struct...)
-  - 새 _C_LIBC_TYPE_ALIASES 세트로 라이브러리 타입 별칭 분리:
-    * <stddef.h>: size_t, ptrdiff_t, wchar_t, max_align_t
-    * <stdint.h>: int8_t, int16_t, int32_t, int64_t, uint8_t, ...
-    * <stdio.h>: FILE, fpos_t
-    * <time.h>: time_t, clock_t
-    * <wchar.h>: wint_t, mbstate_t
-    * <setjmp.h>: jmp_buf, sigjmp_buf
-    * <signal.h>: sig_atomic_t
-    * POSIX <sys/types.h>: ssize_t, pid_t, uid_t, gid_t, off_t, mode_t, ...
-  - _C_ALL_KNOWN_TYPES로 결합하여 marker stripper와 classifier 모두 사용
-  - size_t를 C 키워드로 잘못 분류하던 개념적 오류 수정
+* 패턴 변환기(Path fallback)에도 byte-array 초기화 처리 추가
+  - AST 경로가 실패할 때만 작동하는 fallback path
+  - AST 경로: 정확한 record type + byte array + record initializer 생성
+  - 패턴 경로: 단순한 byte array initializer 생성 (부분 지원)
+  - 패턴 경로는 pcpp를 거치지 않으므로 #ifdef 분기 처리가 안되어
+    제한적 (AST 경로 권장)
 
-* v1.9의 모든 기능 유지:
-  - Usage-based identifier classifier (대소문자 구분 없이)
-  - 소문자 linkage marker 제거 허용
-  - 패턴 경로 일관성 확보
-  - 일반화된 linkage-marker 제거
-  - String-aware comment stripping
-  - C 바이트 배열 → Pascal 배열 상수 변환
-  - typedef chain flattening
-  - GResource, GStaticResource fake 타입 정의
+* 패턴 경로 개선:
+  - __attribute__((...)) GCC annotation 제거 (balanced-paren scan)
+  - static/extern/const/volatile storage class 키워드 strip
+  - C byte-array initializer (문자열 리터럴 나열) → Pascal byte array
+  - init_text recovery (원본 소스에서 { ... } 복구)
+  - _pattern_byte_array_init_to_pascal 헬퍼 추가
+
+* v2.1의 모든 기능 유지:
+  - resources.c의 gresource 패턴 처리 (익명 union + byte-array)
+  - struct InitList → Pascal record constant 변환
+  - typedef → struct 정의 resolve
+  - sizeof/UnaryOp, StructRef, BinaryOp, Cast 등 초기화 표현식 처리
