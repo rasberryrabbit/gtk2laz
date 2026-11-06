@@ -835,7 +835,32 @@ def _record_init_to_pascal(init, typ, ast=None) -> Optional[str]:
     for i in range(n_fields):
         fname = pascalify_name(field_decls[i].name)
         if i < n_inits:
-            fval = _translate_init_expr_to_pascal(init_exprs[i])
+            init_expr = init_exprs[i]
+            # Determine the field's Pascal type to check if it's
+            # a pointer field (e.g. ``const guint8 *data`` → ``PByte``
+            # or ``^Byte``). When a pointer field is initialized
+            # with a ``StructRef`` like ``varname.field``, C uses
+            # array-to-pointer decay. In Pascal, the equivalent
+            # is ``@varname`` (the address of the record, since the
+            # first field of a record/variant record is at offset 0).
+            # We apply ``@`` ONLY when:
+            #   * The field is a pointer type (PtrDecl)
+            #   * The init value is a StructRef (``a.b`` pattern)
+            # This is a general rule that doesn't depend on any
+            # specific field name like ``data``.
+            is_ptr_field = isinstance(field_decls[i].type, c_ast.PtrDecl)
+            is_struct_ref = isinstance(init_expr, c_ast.StructRef)
+            if is_ptr_field and is_struct_ref:
+                # Translate the StructRef normally, then wrap in
+                # ``@(...)`` to take its address. In Pascal, ``@x``
+                # returns a pointer. For ``varname.field`` where
+                # ``field`` is an array, Pascal doesn't auto-decay
+                # to a pointer like C does, so we explicitly take
+                # the address.
+                fval_raw = _translate_init_expr_to_pascal(init_expr)
+                fval = f'@{fval_raw}'
+            else:
+                fval = _translate_init_expr_to_pascal(init_expr)
         else:
             # Default value for missing initializers.
             # Use 'nil' for pointer fields, '0' for others.
@@ -1014,35 +1039,14 @@ def _translate_init_expr_to_pascal(expr, in_sizeof: bool = False) -> str:
         # unnecessary in Pascal for our cases).
         return _translate_init_expr_to_pascal(expr.expr)
     if isinstance(expr, c_ast.StructRef):
-        # ``a.b`` or ``a->b`` → Pascal ``a.b`` or ``a^.b``
-        # Special case: when the struct ref is ``varname.data`` where
-        # ``data`` is the first field of a union that's a byte array,
-        # C treats ``varname.data`` as a pointer to the first element
-        # (array decay). In Pascal, the equivalent is just
-        # ``@varname`` (the address of the record itself, since the
-        # first field of a variant record starts at offset 0). We
-        # detect this pattern: if the field name is ``data`` and the
-        # parent expression is a simple identifier, emit
-        # ``@identifier`` instead of ``identifier.data``.
-        # BUT: inside ``sizeof()``, we must NOT add ``@`` — we want
-        # ``SizeOf(varname)`` (the record size), not
-        # ``SizeOf(@varname)`` (pointer size = 4/8 bytes).
-        if (not in_sizeof
-                and expr.type == '.'
-                and isinstance(expr.name, c_ast.ID)
-                and hasattr(expr.field, 'name')
-                and expr.field.name == 'data'):
-            return f'@{pascalify_name(expr.name.name)}'
-        # Inside sizeof: ``varname.data`` → ``varname`` (the
-        # record itself, since SizeOf on the record gives the same
-        # result as SizeOf on the first field of a variant record).
-        if (in_sizeof
-                and expr.type == '.'
-                and isinstance(expr.name, c_ast.ID)
-                and hasattr(expr.field, 'name')
-                and expr.field.name == 'data'):
-            return pascalify_name(expr.name.name)
-        # General case: ``a.b`` → ``a.b``, ``a->b`` → ``a^.b``
+        # ``a.b`` → Pascal ``a.b``
+        # ``a->b`` → Pascal ``a^.b``
+        # We do NOT apply any special ``@`` conversion here — the
+        # ``varname.field`` reference is translated as-is. When the
+        # field is an array and the context is a pointer assignment
+        # (C array decay), the caller should add ``@`` if needed.
+        # This is more general than hardcoding ``data`` as a
+        # special field name.
         name = _translate_init_expr_to_pascal(expr.name, in_sizeof)
         field = expr.field.name if hasattr(expr.field, 'name') else str(expr.field)
         if expr.type == '->':
