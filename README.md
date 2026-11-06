@@ -363,6 +363,29 @@ breakdown.
 
 ## Limitations and design notes
 
+* **한 번에 한 플랫폼만 변환 가능 (Platform-specific conversion).**
+  The C preprocessor takes a `--platform` flag (`windows` / `linux` /
+  `macos` / `auto`) that decides which `#ifdef _WIN32` /
+  `#ifdef __linux__` / `#ifdef __APPLE__` branches are kept. Each
+  conversion run picks ONE platform's branch — branches for other
+  platforms are dropped. If your source has multi-platform code paths
+  (e.g. one HID device discovery routine for Windows using
+  `SetupDi*`, another for Linux using `/dev/hidraw*`), you must run
+  gtk2laz **once per target platform** and merge the resulting Pascal
+  units by hand. The conversion report's per-file TODO count will
+  tell you which `.pas` files contain platform-specific code paths
+  that need merging.
+
+  Practical workflow for multi-platform projects:
+
+  ```bash
+  gtk2laz convert src/ out_windows/ --platform=windows
+  gtk2laz convert src/ out_linux/   --platform=linux
+  # Then manually merge out_windows/*.pas + out_linux/*.pas into one
+  # project, guarded by FreePascal's {$IFDEF MSWINDOWS} /
+  # {$IFDEF UNIX} conditional blocks.
+  ```
+
 * The C parser is **pattern-based**, not a full C compiler. It handles
   the common cases (function definitions, simple control flow, GTK
   accessor calls, header declarations) and falls back to TODO comments
@@ -672,6 +695,29 @@ breakdown.
 ---
 
 ## Limitations and design notes
+
+* **한 번에 한 플랫폼만 변환 가능 (Platform-specific conversion).**
+  The C preprocessor takes a `--platform` flag (`windows` / `linux` /
+  `macos` / `auto`) that decides which `#ifdef _WIN32` /
+  `#ifdef __linux__` / `#ifdef __APPLE__` branches are kept. Each
+  conversion run picks ONE platform's branch — branches for other
+  platforms are dropped. If your source has multi-platform code paths
+  (e.g. one HID device discovery routine for Windows using
+  `SetupDi*`, another for Linux using `/dev/hidraw*`), you must run
+  gtk2laz **once per target platform** and merge the resulting Pascal
+  units by hand. The conversion report's per-file TODO count will
+  tell you which `.pas` files contain platform-specific code paths
+  that need merging.
+
+  Practical workflow for multi-platform projects:
+
+  ```bash
+  gtk2laz convert src/ out_windows/ --platform=windows
+  gtk2laz convert src/ out_linux/   --platform=linux
+  # Then manually merge out_windows/*.pas + out_linux/*.pas into one
+  # project, guarded by FreePascal's {$IFDEF MSWINDOWS} /
+  # {$IFDEF UNIX} conditional blocks.
+  ```
 
 * The C parser is **pattern-based**, not a full C compiler. It handles
   the common cases (function definitions, simple control flow, GTK

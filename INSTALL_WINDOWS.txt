@@ -11,34 +11,29 @@ gtk2laz v1.8 - Windows 설치 방법
    windows\gtk2laz_win.bat convert E:\path\to\source E:\path\to\output
 
 
+⚠️ 중요: 한 번에 한 플랫폼만 변환 가능
+-------------------------------------
+C 전처리기는 `--platform` 플래그(windows / linux / macos / auto)로
+한 플랫폼의 #ifdef 분기만 선택합니다. 다중 플랫폼 소스(예: Windows의
+SetupDi* + Linux의 /dev/hidraw*)를 변환할 때는 플랫폼별로 한 번씩
+gtk2laz를 실행한 후, 결과 .pas 파일들을 FreePascal의
+{$IFDEF MSWINDOWS} / {$IFDEF UNIX} 블록으로 직접 병합해야 합니다.
+
+  예:
+    gtk2laz convert src/ out_windows/ --platform=windows
+    gtk2laz convert src/ out_linux/   --platform=linux
+    # 그 후 out_windows/*.pas + out_linux/*.pas를 수동 병합
+
+
 v1.8 변경 사항
 =============
 * Usage-based identifier classifier 도입 (사용자 제안)
   - marker 후보를 strip하기 전에 전체 텍스트를 한 번 스캔해서
     각 대문자 식별자를 type / const / variable / unknown로 분류
-  - 분류 기준:
-    * typedef ... NAME; → type (가중치 3)
-    * NAME *foo → type (가중치 2)
-    * NAME x; (x는 소문자) → type (가중치 1)
-    * (NAME)expr → type (캐스트, 가중치 2)
-    * sizeof(NAME) → type (가중치 3)
-    * = NAME; → const (상수)
-    * NAME(...) → variable (함수 호출)
-    * NAME = ...; → variable (할당)
   - 분류가 'type'이면 marker로 strip하지 않음 (GtkWidget *window; 보호)
-  - 분류가 'const'/'variable'/'unknown'이면 marker로 간주하고 strip
-  - 보수적 결정: 의심스러우면 'type'으로 분류 (잘못 strip하면
-    AST 파싱이 깨지는 것보다 marker를 남겨서 명확한 에러 메시지가
-    나오는 편이 더 안전)
+  - 보수적 결정: 의심스러우면 'type'으로 분류
 
-* _strip_linkage_marker_same_line에도 usage_map 전달
-  - 같은 줄에 있는 marker도 usage_map 확인 후 strip 결정
-  - Case B (NAME *foo): next_ident도 usage_map에서 type인지 확인
-
-* v1.7의 모든 기능 유지:
-  - 패턴 경로 일관성 확보
-  - 일반화된 linkage-marker 제거
-  - String-aware comment stripping
-  - C 바이트 배열 → Pascal 배열 상수 변환
-  - typedef chain flattening
-  - GResource, GStaticResource fake 타입 정의
+* 한 번에 한 플랫폼만 변환 가능 명시 (사용자 제안)
+  - README.md와 README_FIRST.txt의 Limitations 섹션에 명시
+  - 다중 플랫폼 소스는 플랫폼별 변환 후 수동 병합 필요
+  - FreePascal의 {$IFDEF MSWINDOWS} / {$IFDEF UNIX} 블록 권장
