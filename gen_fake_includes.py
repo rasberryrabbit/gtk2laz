@@ -344,6 +344,23 @@ typedef long gint64;
 typedef unsigned long guint64;
 typedef int GCallback;
 typedef void* GObject;
+// GLib resource-bundle types (used by glib-compile-resources output
+// in resources.c). ``GResource`` is the opaque handle returned by
+// g_resource_load() / g_static_resource_get_resource(), and
+// ``GStaticResource`` is the static initializer struct used by
+// ``static GStaticResource static_resource = { data, size, NULL,
+// NULL, NULL };``. Without these two typedefs, pycparser aborts on
+// ``GResource *resources_get_resource(void);`` and on the static
+// initializer (real opgui-0.12.4 resources.c case).
+typedef struct _GResource GResource;
+typedef struct _GStaticResource GStaticResource;
+struct _GStaticResource {
+    const guint8 *data;
+    gsize data_size;
+    GStaticResource *next;
+    void *result;
+    void *priv;
+};
 #define G_CALLBACK(f) ((GCallback)(f))
 #define G_OBJECT(o) ((GObject)(o))
 #define GTK_WINDOW(w) ((GtkWindow*)(w))

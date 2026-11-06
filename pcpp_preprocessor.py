@@ -319,9 +319,12 @@ class FakeIncludePreprocessor(Preprocessor):
         except OSError:
             return path
         content = content.replace("\r\n", "\n").replace("\r", "\n")
-        # Strip comments
-        content = _re_mod.sub(r"/\*.*?\*/", " ", content, flags=_re_mod.S)
-        content = _re_mod.sub(r"//[^\n]*", "", content)
+        # Strip comments using the string-aware stripper. The naive
+        # ``re.sub(r"//[^\n]*", "", content)`` would damage fake-header
+        # typedefs that contain ``//`` inside C string literals
+        # (e.g. some winsock2.h error message strings). The string-
+        # aware stripper preserves string and char literals verbatim.
+        content = _strip_comments_string_aware(content)
         # Strip # directives
         cleaned_lines = []
         for line in content.splitlines():
@@ -761,6 +764,19 @@ def preprocess(c_path: str,
         "EXTERN extern",
         "DLLEXPORT extern",
         "DLLIMPORT extern",
+        # GLib/GTK linkage markers. We still pre-define these so
+        # pcpp expands them to ``extern`` (or empty) BEFORE the
+        # text reaches the post-pcpp ``_strip_unknown_linkage_markers``
+        # pass. The post-pcpp pass is the GENERIC fallback that
+        # catches any marker we forgot to list here — but defining
+        # the common ones explicitly means pcpp's own macro
+        # expansion handles them properly (which is more accurate
+        # than the line-by-line heuristic). The list is kept short
+        # on purpose; the generic stripper handles the long tail.
+        "G_MODULE_EXPORT extern",
+        "G_MODULE_IMPORT extern",
+        "G_GNUC_INTERNAL ",
+        "GLIB_VAR extern",
         # NOTE: WINAPI, STDCALL, CALLBACK, CDECL are NOT defined here
         # as ``extern``. These are CALLING CONVENTION keywords, not
         # linkage specifiers. They are handled by ``_CALLCONV_MAP``
@@ -1300,6 +1316,71 @@ def preprocess(c_path: str,
     text = _re_mod.sub(r'\bdllexport\s*', '', text)
     text = _re_mod.sub(r'\bdllimport\s*', '', text)
 
+    # ---- Strip ``__attribute__((visibility("default")))`` and
+    # similar GCC-style visibility markers. GLib uses these in
+    # ``G_MODULE_EXPORT`` on Linux:
+    #     #define G_MODULE_EXPORT __attribute__((visibility("default")))
+    # The Windows define maps G_MODULE_EXPORT to ``extern`` (which we
+    # already handle), but if pcpp didn't expand the macro because the
+    # user's source used a Linux-flavored header (or the macro was
+    # defined differently), we still see the raw ``__attribute__``
+    # tokens here. pycparser can't parse ``__attribute__`` — strip
+    # it. The non-greedy ``[^)]*`` matches up to the first ``)``; we
+    # then explicitly look for the trailing ``)``.
+    text = _re_mod.sub(
+        r'__attribute__\s*\(\s*\([^)]*\)\s*\)\s*', '', text
+    )
+
+    # ---- Strip unknown linkage-marker macros that precede a
+    # function declaration or variable declaration.
+    #
+    # When pcpp passes through a macro that wasn't defined (because
+    # the corresponding header wasn't included, or its #ifdef branch
+    # wasn't taken), the macro name remains as a bare identifier in
+    # the preprocessed text. If that identifier appears IMMEDIATELY
+    # before a type name in a function declaration, pycparser
+    # treats it as the return type and aborts with
+    # ``<file>:<line>: before: <token>`` when it hits the real
+    # function signature.
+    #
+    # Examples we've seen in real C sources:
+    #   G_MODULE_EXPORT GResource *resources_get_resource(void);
+    #   GDK_AVAILABLE_IN_ALL GdkWindow *gdk_get_default_root_window(void);
+    #   _GLIB_EXTERN GObject *g_object_new(GType, ...);
+    #   SDL_FORCE_INLINE void * SDL_malloc(size_t);
+    #
+    # All of these are LINKAGE MARKERS — they affect how the linker
+    # exports/imports the symbol but DON'T change the function's
+    # signature. The correct C-semantic interpretation is to treat
+    # them as ``extern`` (i.e. drop them and let the function's
+    # natural storage class take effect).
+    #
+    # Strategy (suggested by the user): rather than maintaining an
+    # ever-growing list of "known" export markers, we use a generic
+    # heuristic — at the START of any line that looks like a
+    # function or variable declaration, if the leading token is an
+    # uppercase-initial identifier that is NOT a known type and NOT
+    # a C keyword, drop it.
+    #
+    # To avoid false positives (e.g. user-defined typedefs that
+    # happen to start with an uppercase letter), we restrict this
+    # to lines where:
+    #   * the identifier is followed by something that LOOKS like a
+    #     return type (an ``int``, ``void``, ``char``, ``unsigned``,
+    #     ``const``, ``struct``, ``enum``, ``union``, OR another
+    #     ``TypedefName *``), OR
+    #   * the identifier is followed by ``*`` (pointer) and then a
+    #     function declarator.
+    # This catches ``G_MODULE_EXPORT GResource *foo(void);`` without
+    # also catching ``GtkWidget *window;`` (where GtkWidget IS the
+    # return type).
+    #
+    # The detection is done line-by-line on the preprocessed text
+    # (after pcpp has expanded all real macros). At this point, ANY
+    # surviving ALL_CAPS或多字符标识符 followed by a recognizable
+    # C type keyword is almost certainly a linkage marker.
+    text = _strip_unknown_linkage_markers(text)
+
     # pcpp emits #line directives (since we set line_directive = "#line").
     # pycparser understands #line directives and uses them to set coord.file
     # on each AST node, which lets us filter out system-header nodes.
@@ -1330,12 +1411,411 @@ def preprocess(c_path: str,
     #     we prepend to the text.
     # We strip ALL comments here as a final safety net so pycparser
     # always sees comment-free text.
-    # Strip block comments (/* ... */) — non-greedy, multiline.
-    text = _re_mod.sub(r"/\*.*?\*/", " ", text, flags=_re_mod.S)
-    # Strip line comments (// ... to end of line).
-    text = _re_mod.sub(r"//[^\n]*", "", text)
+    #
+    # ---- STRING-AWARE comment stripping ----
+    # The naive approach ``re.sub(r"//[^\n]*", "", text)`` is WRONG
+    # because it does not understand C string literals. C sources
+    # like ``icons.c`` contain byte-array initializers such as
+    # ``"\377\0\0" "more data"`` and even strings with embedded
+    # ``//`` sequences like ``"\17///\15>>>X"`` (used as image pixel
+    # data). A naive ``//``-stripper would treat the ``//`` inside
+    # the string as a line comment and delete the rest of the line,
+    # leaving an unterminated string literal — which then makes
+    # pycparser abort with ``Illegal character '"'`` (opgui-0.12.4
+    # icons.c case).
+    #
+    # We walk the text character-by-character with a small state
+    # machine that recognizes:
+    #   * C string literals:    " ... "   (with ``\"`` escapes)
+    #   * C char literals:      ' ... '   (with ``\'`` escapes)
+    #   * Block comments:       /* ... */ (replaced with a space)
+    #   * Line comments:         // ... to end of line (deleted)
+    # Anything inside a string or char literal is preserved verbatim,
+    # so ``"\17///\15"`` survives intact.
+    text = _strip_comments_string_aware(text)
 
     return text
+
+
+def _strip_comments_string_aware(text: str) -> str:
+    """Strip C comments while preserving string and char literals.
+
+    Walks the input character by character with a state machine
+    that knows about C string literals (``"..."``), char literals
+    (``'...'``), block comments (``/* ... */``), and line comments
+    (``// ... to end of line``). Anything inside a string or char
+    literal is preserved verbatim; comments are removed.
+
+    This is needed because the naive regex approach
+    ``re.sub(r"//[^\n]*", "", text)`` does not understand string
+    literals and would treat the ``//`` inside a C string (such as
+    ``"\\17///\\15"`` in icons.c) as a line comment, deleting the
+    rest of the line and leaving an unterminated string literal
+    that breaks pycparser.
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        # ---- Line comment: // ... to end of line
+        if c == '/' and i + 1 < n and text[i + 1] == '/':
+            # Skip to end of line (or end of input).
+            while i < n and text[i] != '\n':
+                i += 1
+            # Don't consume the newline — let the outer loop emit it.
+            continue
+        # ---- Block comment: /* ... */ (possibly multi-line)
+        if c == '/' and i + 1 < n and text[i + 1] == '*':
+            # Replace with a single space (preserves token separation).
+            # Skip to the closing */ (or end of input).
+            i += 2
+            while i + 1 < n and not (text[i] == '*' and text[i + 1] == '/'):
+                i += 1
+            i += 2  # skip the closing */ (or run to end)
+            out.append(' ')
+            continue
+        # ---- String literal: " ... " (with \" escapes)
+        if c == '"':
+            out.append(c)
+            i += 1
+            while i < n:
+                ch = text[i]
+                out.append(ch)
+                if ch == '\\' and i + 1 < n:
+                    # Escape: copy the next char verbatim (handles
+                    # \", \\, \n, \377 octal, \x1f hex, etc.)
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                if ch == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        # ---- Char literal: ' ... ' (with \' escapes)
+        if c == "'":
+            out.append(c)
+            i += 1
+            while i < n:
+                ch = text[i]
+                out.append(ch)
+                if ch == '\\' and i + 1 < n:
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                if ch == "'":
+                    i += 1
+                    break
+                i += 1
+            continue
+        # ---- Regular character
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
+
+# ----------------------------------------------------------------------
+# C built-in keywords and standard type names. Used by
+# ``_strip_unknown_linkage_markers`` to recognize when a leading
+# identifier is followed by a real C type (so the identifier must
+# be a linkage marker, not the type itself).
+# ----------------------------------------------------------------------
+_C_TYPE_KEYWORDS = frozenset({
+    # C primitive types and qualifiers
+    'void', 'char', 'short', 'int', 'long', 'float', 'double',
+    'signed', 'unsigned', 'const', 'volatile', 'restrict',
+    'struct', 'union', 'enum', '_Bool', '_Complex', '_Atomic',
+    # C storage classes (NOT linkage markers — these come from the
+    # language, not from a macro)
+    'extern', 'static', 'auto', 'register', 'inline', '_Noreturn',
+    'typedef',
+    # GCC/MSVC built-in types that pycparser does NOT know but
+    # that we treat as types anyway (after pcpp has expanded them)
+    '__int8', '__int16', '__int32', '__int64',
+    '__uint8', '__uint16', '__uint32', '__uint64',
+    'size_t', 'ssize_t', 'ptrdiff_t', 'wchar_t',
+})
+
+# Linkage markers we KNOW about. We still pre-strip these via
+# ``gnu_defines`` in ``preprocess()``, but listing them here lets
+# ``_strip_unknown_linkage_markers`` skip them quickly without
+# checking the lookahead.
+_KNOWN_LINKAGE_MARKERS = frozenset({
+    'G_MODULE_EXPORT', 'G_MODULE_IMPORT', 'G_GNUC_INTERNAL',
+    'G_GNUC_DEPRECATED', 'G_GNUC_NORETURN', 'G_GNUC_MALLOC',
+    'G_GNUC_PURE', 'G_GNUC_CONST', 'G_GNUC_WARN_UNUSED_RESULT',
+    'G_GNUC_NULL_TERMINATED',
+    'GLIB_VAR', 'GLIB_DEPRECATED', 'GLIB_AVAILABLE_IN_ALL',
+    'GDK_AVAILABLE_IN_ALL', 'GDK_DEPRECATED',
+    'GTK_AVAILABLE_IN_ALL', 'GTK_DEPRECATED',
+    '_GLIB_EXTERN', '_GDK_EXTERN', '_GTK_EXTERN',
+    'DLL_EXPORT', 'DLL_IMPORT',
+    'SDL_FORCE_INLINE', 'SDL_INLINE', 'SDL_API',
+    'ENET_API', 'OPENVG_API', 'CAIRO_API',
+})
+
+
+def _strip_unknown_linkage_markers(text: str) -> str:
+    """Strip unknown linkage-marker macros that precede declarations.
+
+    After pcpp preprocessing, any macro that wasn't defined (because
+    the user's source didn't ``#include`` the header that defines it,
+    or because its ``#ifdef`` branch wasn't taken) survives as a
+    bare identifier in the preprocessed text. If that identifier
+    appears IMMEDIATELY before a function/variable declaration,
+    pycparser treats the identifier as the return type and aborts
+    with ``<file>:<line>: before: <token>`` when it can't parse the
+    rest of the signature.
+
+    Examples we've seen in real C sources:
+      G_MODULE_EXPORT GResource *resources_get_resource(void);
+      GDK_AVAILABLE_IN_ALL GdkWindow *gdk_get_default_root_window(void);
+      _GLIB_EXTERN GObject *g_object_new(GType, ...);
+      SDL_FORCE_INLINE void * SDL_malloc(size_t);
+
+    All of these are LINKAGE MARKERS — they tell the linker how to
+    export/import the symbol but DON'T change the function's type
+    signature. The correct C-semantic interpretation is to drop them
+    and let the function's natural storage class take effect.
+
+    Strategy (suggested by the user): instead of maintaining an
+    ever-growing list of "known" export markers, we use a generic
+    heuristic — at the START of any line that looks like a function
+    or variable declaration, if the leading token is an
+    uppercase-initial identifier that is NOT a C type/keyword and
+    NOT a known type, drop it.
+
+    To avoid false positives (e.g. user-defined typedefs that
+    happen to start with an uppercase letter, where the typedef IS
+    the return type), we only strip when the leading identifier is
+    followed by something that LOOKS LIKE a real C type. The
+    follow-up patterns we recognize:
+      * A C built-in type keyword (int, void, char, unsigned,
+        struct, enum, union, const, ...).
+      * Another identifier followed by ``*`` (e.g.
+        ``G_MODULE_EXPORT GResource *foo(...)`` — the second
+        ``GResource`` is the return type).
+      * Another identifier followed by `` IDENT(`` (a function
+        declarator with a named return type).
+
+    The marker may be on its OWN line followed by the real
+    declaration on the next line:
+      G_MODULE_EXPORT
+      GResource *resources_get_resource(void);
+
+    We handle both the single-line case and the multi-line case
+    where the marker is alone on its line.
+
+    We do this on a LINE-BY-LINE basis to avoid damaging
+    multi-line string literals or comment bodies that may contain
+    sequences resembling the pattern.
+    """
+    if not text:
+        return text
+    # First pass: handle markers ALONE on their own line — strip the
+    # whole line if it consists ONLY of a linkage-marker identifier
+    # AND the next non-empty line starts with what looks like a
+    # function/variable declaration (a C type keyword, or another
+    # identifier followed by ``*`` or ``(``). This is the most
+    # common case for GLib's G_MODULE_EXPORT which is written on
+    # its own line above the function declaration:
+    #     G_MODULE_EXPORT
+    #     GResource *resources_get_resource(void);
+    # The same-line case (``G_MODULE_EXPORT GResource *foo();``)
+    # is handled by ``_strip_linkage_marker_same_line``.
+    lines = text.splitlines(keepends=True)
+    n_lines = len(lines)
+    out_lines: list[str] = []
+    i = 0
+    while i < n_lines:
+        line = lines[i]
+        content = line.rstrip('\r\n')
+        stripped = content.lstrip()
+        if not stripped:
+            out_lines.append(line)
+            i += 1
+            continue
+        # Skip preprocessor directives, comments, and lines that
+        # don't start with an identifier.
+        if (stripped.startswith('#')
+                or stripped.startswith('//')
+                or stripped.startswith('/*')
+                or not (stripped[0].isalpha() or stripped[0] == '_')):
+            out_lines.append(line)
+            i += 1
+            continue
+        # Extract the first identifier.
+        j = 0
+        n = len(stripped)
+        while j < n and (stripped[j].isalnum() or stripped[j] == '_'):
+            j += 1
+        first_ident = stripped[:j]
+        rest = stripped[j:]
+        # Skip if the identifier is a C keyword or known type.
+        if first_ident in _C_TYPE_KEYWORDS:
+            out_lines.append(line)
+            i += 1
+            continue
+        # Skip if it's all-lowercase and doesn't start with ``_``
+        # (those are not linkage markers).
+        has_upper = any(c.isupper() for c in first_ident)
+        if not has_upper and not first_ident.startswith('_'):
+            out_lines.append(line)
+            i += 1
+            continue
+        # Check whether this is a STANDALONE marker line (just the
+        # identifier, optional whitespace, optional comment).
+        rest_stripped = rest.strip()
+        is_standalone = (not rest_stripped
+                         or rest_stripped.startswith('//')
+                         or rest_stripped.startswith('/*'))
+        if is_standalone:
+            # Look ahead at the next non-empty line to see if it
+            # looks like a declaration that the marker is
+            # introducing.
+            k = i + 1
+            next_decl_line = None
+            while k < n_lines:
+                next_content = lines[k].rstrip('\r\n')
+                next_stripped = next_content.lstrip()
+                if not next_stripped:
+                    k += 1
+                    continue
+                next_decl_line = next_stripped
+                break
+            if next_decl_line and _looks_like_decl_start(next_decl_line):
+                # This is a standalone marker. Replace the line
+                # with a comment, keeping the trailing newline.
+                trailing_nl = ''
+                if line.endswith('\r\n'):
+                    trailing_nl = '\r\n'
+                elif line.endswith('\n'):
+                    trailing_nl = '\n'
+                out_lines.append(
+                    f"/* stripped linkage marker: {first_ident} */"
+                    f"{trailing_nl}"
+                )
+                i += 1
+                continue
+            # Not a marker — leave the line unchanged.
+            out_lines.append(line)
+            i += 1
+            continue
+        # Otherwise, the marker is on the same line as the rest of
+        # the declaration. Try the same-line stripping.
+        out_lines.append(_strip_linkage_marker_same_line(line))
+        i += 1
+    return ''.join(out_lines)
+
+
+def _looks_like_decl_start(line: str) -> bool:
+    """Heuristic: does this line look like the start of a declaration?
+
+    Used to decide whether to strip a standalone marker line above
+    this line. We return True for:
+      * ``int foo(...)``, ``void foo(...)``, ``char foo(...)``, ...
+      * ``GtkWidget *foo(...)``
+      * ``struct Foo bar;``
+      * ``extern int x;``
+      * Any line that starts with an identifier (either a C
+        keyword or a typedef name) followed by either ``*`` or
+        ``(`` or another identifier.
+    """
+    if not line:
+        return False
+    if line.startswith('#') or line.startswith('//') \
+            or line.startswith('/*'):
+        return False
+    # First identifier.
+    i = 0
+    n = len(line)
+    while i < n and (line[i].isalnum() or line[i] == '_'):
+        i += 1
+    if i == 0:
+        return False
+    first = line[:i]
+    rest = line[i:].lstrip()
+    # If the first identifier is a known C type keyword, this looks
+    # like a declaration.
+    if first in _C_TYPE_KEYWORDS:
+        return True
+    # Otherwise, the first identifier is a typedef name. The next
+    # token must be ``*`` (pointer) or another identifier (variable
+    # name) — NOT ``;`` (which would mean ``typedef_name;`` is an
+    # unrelated statement like ``GtkWidget;``).
+    if not rest:
+        return False
+    if rest.startswith('*'):
+        return True
+    # Another identifier followed by ``(`` or ``;`` or ``,`` looks
+    # like a declaration: ``GResource foo(void);``
+    if rest[0].isalpha() or rest[0] == '_':
+        return True
+    return False
+
+
+def _strip_linkage_marker_same_line(line: str) -> str:
+    """Strip a leading linkage marker from one line, if present.
+
+    Returns the (possibly modified) line.
+    """
+    # Get the indentation (whitespace at the start) and the rest.
+    stripped = line.lstrip()
+    if not stripped:
+        return line
+    indent_len = len(line) - len(stripped)
+    indent = line[:indent_len]
+    # Don't touch lines that are preprocessor directives, comments,
+    # or that start with a non-identifier character.
+    if stripped.startswith('#'):
+        return line
+    if stripped.startswith('//') or stripped.startswith('/*'):
+        return line
+    # First character must be an identifier start (letter or _).
+    if not (stripped[0].isalpha() or stripped[0] == '_'):
+        return line
+    # Extract the first identifier.
+    i = 0
+    n = len(stripped)
+    while i < n and (stripped[i].isalnum() or stripped[i] == '_'):
+        i += 1
+    first_ident = stripped[:i]
+    rest = stripped[i:]
+    # Skip if the identifier is a C keyword or known type.
+    if first_ident in _C_TYPE_KEYWORDS:
+        return line
+    # Skip if it's all-lowercase (typical for C identifiers in
+    # function bodies — these are not linkage markers).
+    has_upper = any(c.isupper() for c in first_ident)
+    if not has_upper and not first_ident.startswith('_'):
+        return line
+    # Now look at what follows the first identifier. Strip leading
+    # whitespace from ``rest``.
+    rest_stripped = rest.lstrip()
+    if not rest_stripped:
+        return line
+    # Case A: the next token is a C built-in type keyword or a
+    # storage class. The first identifier is a linkage marker.
+    next_ident_end = 0
+    while (next_ident_end < len(rest_stripped)
+           and (rest_stripped[next_ident_end].isalnum()
+                or rest_stripped[next_ident_end] == '_')):
+        next_ident_end += 1
+    next_ident = rest_stripped[:next_ident_end]
+    if next_ident in _C_TYPE_KEYWORDS:
+        marker = first_ident
+        return f"{indent}/* stripped linkage marker: {marker} */ {rest}"
+    # Case B: the next token is another identifier (a typedef name
+    # used as a return type). The first identifier is a linkage
+    # marker only if THAT typedef name is followed by ``*`` or by
+    # an open paren (function declarator).
+    if next_ident:
+        after_next = rest_stripped[next_ident_end:].lstrip()
+        if after_next.startswith('*'):
+            marker = first_ident
+            return f"{indent}/* stripped linkage marker: {marker} */ {rest}"
+    return line
 
 
 def _strip_extern_c_blocks(text: str) -> str:

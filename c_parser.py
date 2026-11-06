@@ -1131,7 +1131,16 @@ _KNOWN_TYPEDEFS = {
 _FUNC_DEF_RE = re.compile(
     r"""
     ^\s*
-    (?:static\s+|extern\s+|inline\s+|G_MODULE_EXPORT\s+)*  # optional storage
+    (?:static\s+|extern\s+|inline\s+)*  # optional storage
+    # Optional linkage-marker macros before the function. The pattern
+    # translator's source path does NOT go through pcpp, so any
+    # export/deprecated marker that the user's source used (e.g.
+    # G_MODULE_EXPORT, GDK_AVAILABLE_IN_ALL, _GLIB_EXTERN,
+    # SDL_FORCE_INLINE, ...) survives into src_clean and would block
+    # the function-definition regex. We allow an arbitrary number
+    # of ALL_UPPERCASE or _Init uppercase identifiers followed by
+    # whitespace, then the real storage class.
+    (?:[A-Z_][A-Z0-9_]*\s+)*
     (?:const\s+)?                                          # optional const
     (?P<ret>[\w][\w\s\*]*?)                                # return type (lazy)
     \s+
@@ -5690,6 +5699,19 @@ class CFileTranslator:
                       f"no function-like macros extracted — using "
                       f"original source for AST parse", file=sys.stderr)
         src_clean, directives = strip_preprocessor(src_clean)
+        # Apply the same linkage-marker stripping that the AST path
+        # gets via pcpp_preprocessor.preprocess(). The pattern path
+        # does NOT go through pcpp, so any export/deprecated marker
+        # that the user's source used (G_MODULE_EXPORT,
+        # GDK_AVAILABLE_IN_ALL, _GLIB_EXTERN, SDL_FORCE_INLINE, ...)
+        # would survive into src_clean and break the function-definition
+        # regex. We import the function lazily so we don't take a
+        # circular-import hit on module load.
+        try:
+            from pcpp_preprocessor import _strip_unknown_linkage_markers
+            src_clean = _strip_unknown_linkage_markers(src_clean)
+        except Exception:
+            pass
         # Normalise spaced multi-char operators (e.g. ``peer -> field``
         # with spaces around ``->``) to their unspaced forms so the
         # downstream pattern-based translator and _OP_REPLACE table can
@@ -5891,7 +5913,22 @@ class CFileTranslator:
                 if g.name in seen_names:
                     continue
                 seen_names.add(g.name)
-                out.append(f"  {g.name}: {g.pascal_type};")
+                # Byte-array initializer: emit as a typed Pascal array
+                # constant (icons.c ``const guint8 write_icon[] = ...``).
+                # The initializer string starts with ``($`` — see
+                # ``_byte_array_init_to_pascal`` in ast_translator.
+                # Pascal's typed array constant requires known bounds,
+                # so we count the bytes and emit
+                # ``array[0..N-1] of Byte = ($XX, $XX, ...)``.
+                if g.init and g.init.startswith('('):
+                    n_bytes = g.init.count('$')
+                    if g.pascal_type == 'array of Byte':
+                        pas_type = f'array[0..{n_bytes}-1] of Byte'
+                    else:
+                        pas_type = g.pascal_type
+                    out.append(f"  {g.name}: {pas_type} = {g.init};")
+                else:
+                    out.append(f"  {g.name}: {g.pascal_type};")
             out.append("")
             self.stats["globals"] = len(seen_names)
         elif globals_list:
