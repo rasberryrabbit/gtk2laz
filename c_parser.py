@@ -5707,9 +5707,16 @@ class CFileTranslator:
         # would survive into src_clean and break the function-definition
         # regex. We import the function lazily so we don't take a
         # circular-import hit on module load.
+        # We also use the usage-based identifier classifier so we
+        # don't accidentally strip a real type (e.g. GtkWidget) that
+        # is used as the return type of a function.
         try:
-            from pcpp_preprocessor import _strip_unknown_linkage_markers
-            src_clean = _strip_unknown_linkage_markers(src_clean)
+            from pcpp_preprocessor import (
+                _strip_unknown_linkage_markers,
+                _classify_identifier_usages,
+            )
+            usage_map = _classify_identifier_usages(src_clean)
+            src_clean = _strip_unknown_linkage_markers(src_clean, usage_map)
         except Exception:
             pass
         # Normalise spaced multi-char operators (e.g. ``peer -> field``

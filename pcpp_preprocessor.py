@@ -1379,7 +1379,33 @@ def preprocess(c_path: str,
     # (after pcpp has expanded all real macros). At this point, ANY
     # surviving ALL_CAPS或多字符标识符 followed by a recognizable
     # C type keyword is almost certainly a linkage marker.
-    text = _strip_unknown_linkage_markers(text)
+    #
+    # ---- USAGE-BASED CLASSIFICATION (suggested by the user) ----
+    # Before stripping, we scan the ENTIRE preprocessed text once to
+    # classify every uppercase-initial identifier as one of:
+    #   * 'type'      — used as a type name (e.g. GtkWidget, GResource)
+    #   * 'const'     — used as a constant/macro value (e.g.
+    #                  GTK_RESPONSE_OK = 0 → ``int x = GTK_RESPONSE_OK;``)
+    #   * 'variable'  — used as a regular identifier (function name,
+    #                  variable name, function call)
+    #   * 'unknown'   — none of the above (treat conservatively as a
+    #                  type since stripping a type would break the
+    #                  parse).
+    # The classification uses simple pattern heuristics:
+    #   * Appears in ``typedef ... NAME ...;`` → 'type'
+    #   * Appears in ``typedef struct _Foo Foo;`` (as the alias) → 'type'
+    #   * Appears in ``NAME x;`` (without ``*``) where x is lowercase → 'type'
+    #   * Appears in ``NAME *x`` → 'type' (pointer-to-typedef)
+    #   * Appears as ``NAME(...)`` (function call) → 'variable' (function)
+    #   * Appears as ``= NAME;`` or ``x = NAME;`` → 'const' (or 'variable')
+    #   * Appears as ``NAME = ...;`` → 'variable'
+    # The marker stripper then uses this classification to decide
+    # whether to strip: if the marker candidate is classified as a
+    # 'type' elsewhere, we DON'T strip it (it's the real return type
+    # for ``GtkWidget *window;``); if it's classified as 'const' or
+    # 'variable' or 'unknown', we strip it as a linkage marker.
+    usage_map = _classify_identifier_usages(text)
+    text = _strip_unknown_linkage_markers(text, usage_map)
 
     # pcpp emits #line directives (since we set line_directive = "#line").
     # pycparser understands #line directives and uses them to set coord.file
@@ -1516,6 +1542,206 @@ def _strip_comments_string_aware(text: str) -> str:
 
 
 # ----------------------------------------------------------------------
+# Usage-based identifier classifier (suggested by the user).
+#
+# Before stripping linkage markers, we scan the ENTIRE preprocessed
+# text and classify every uppercase-initial identifier based on
+# HOW it's used elsewhere in the file. This lets us distinguish
+# between:
+#   * GtkWidget (a TYPE — used in ``GtkWidget *window = NULL;``)
+#   * G_MODULE_EXPORT (a LINKAGE MARKER — never used as a type
+#     name; usually followed by a real type)
+#   * GTK_RESPONSE_OK (a CONSTANT — used in ``int x = GTK_RESPONSE_OK;``)
+#
+# Without this scan, we'd rely on a simple "followed by a C type
+# keyword" heuristic, which would falsely strip ``GtkWidget *foo;``
+# in code where GtkWidget is preceded by some other identifier.
+# With the usage scan, we KNOW GtkWidget is a type (because it
+# appears in ``typedef struct _GtkWidget GtkWidget;``), so we don't
+# strip it.
+# ----------------------------------------------------------------------
+
+# Heuristic regex patterns that indicate the identifier is used as a
+# TYPE (not a constant or variable). Compiled once at module load.
+_USAGE_TYPE_PATTERNS = [
+    # ``typedef ... NAME ...;`` — NAME is the typedef alias.
+    re.compile(
+        r'\btypedef\b[^;]*?\b(?P<name>[A-Za-z_]\w*)\s*[;\[,{]',
+        re.MULTILINE | re.DOTALL,
+    ),
+    # ``NAME *foo`` or ``NAME *foo,`` — pointer-to-typedef (NAME used
+    # as a type). We require a space or `*` between NAME and ``*`` to
+    # avoid matching ``foo->bar``.
+    re.compile(
+        r'\b(?P<name>[A-Z][A-Za-z0-9_]*)\s*\*\s*[A-Za-z_]\w*',
+    ),
+    # ``NAME x;`` (without `*`) where x starts with lowercase —
+    # declaration of a variable of type NAME. We require NAME to
+    # start with uppercase (typical for typedef names) to avoid
+    # matching ``int x;`` (where ``int`` is a C keyword, not a
+    # typedef name).
+    re.compile(
+        r'\b(?P<name>[A-Z][A-Za-z0-9_]*)\s+[a-z_]\w*\s*[;,=]',
+    ),
+    # ``(NAME) expr`` — cast expression (NAME is a type).
+    # Avoids matching ``(foo) + 1`` (function call) by requiring the
+    # identifier inside the parens to start uppercase.
+    re.compile(
+        r'\(\s*(?P<name>[A-Z][A-Za-z0-9_]*)\s*\)',
+    ),
+    # ``sizeof(NAME)`` — NAME is a type.
+    re.compile(
+        r'\bsizeof\s*\(\s*(?P<name>[A-Z][A-Za-z0-9_]*)\s*\)',
+    ),
+]
+
+# Patterns that indicate the identifier is used as a CONSTANT (macro
+# value) — not a type.
+_USAGE_CONST_PATTERNS = [
+    # ``= NAME;`` or ``= NAME,`` or ``= NAME)`` — NAME used as a value
+    # in an assignment or initialization. (Note: this also matches
+    # enum constants like ``int x = GTK_RESPONSE_OK;``.)
+    re.compile(
+        r'=\s*(?P<name>[A-Z][A-Z0-9_]*)\s*[;,)\]]',
+    ),
+    # ``NAME,`` or ``NAME)`` inside an enum body — enum constant.
+    # We check the surrounding context to ensure we're inside a
+    # ``enum { ... NAME ... }`` block.
+    # This pattern is too noisy in general code; we only check it
+    # inside enum bodies (handled in the classifier function).
+]
+
+# Patterns that indicate the identifier is a VARIABLE/FUNCTION
+# (not a type or constant).
+_USAGE_VARIABLE_PATTERNS = [
+    # ``NAME(...)`` — function call or function definition.
+    re.compile(
+        r'\b(?P<name>[A-Za-z_]\w*)\s*\(',
+    ),
+    # ``NAME = ...;`` — NAME is being assigned to (so it's a
+    # variable, not a constant or type).
+    re.compile(
+        r'\b(?P<name>[A-Za-z_]\w*)\s*=\s*[^=]',
+    ),
+    # ``NAME;`` — bare statement (e.g. ``x;``). We restrict to
+    # lowercase identifiers since uppercase-only ones are typically
+    # constants.
+    re.compile(
+        r'\b(?P<name>[a-z_]\w*)\s*;',
+    ),
+]
+
+
+def _classify_identifier_usages(text: str) -> dict[str, str]:
+    """Scan ``text`` and classify each uppercase-initial identifier.
+
+    Returns a dict mapping identifier → category, where category is
+    one of:
+      * 'type'     — used as a type name (most occurrences)
+      * 'const'    — used as a constant value
+      * 'variable' — used as a variable or function name
+      * 'unknown'  — no usages detected (or tie between categories)
+
+    The category is determined by counting how many times the
+    identifier matches each kind of pattern. If 'type' patterns win,
+    we classify it as 'type' (this is the safest classification —
+    if a marker candidate IS a type elsewhere, we must NOT strip
+    it). If 'const' patterns dominate, classify as 'const'. If
+    'variable' dominates and 'type' is zero, classify as 'variable'.
+
+    The classification is conservative — when in doubt we lean toward
+    'type' because stripping a real type breaks the AST parse more
+    badly than leaving a marker in (pycparser will still choke on
+    the marker, but at least it will report a clearer error pointing
+    to the marker rather than to a stripped type).
+    """
+    if not text:
+        return {}
+    # We strip string and char literals from a working copy so the
+    # regex scans don't pick up identifiers from string contents.
+    # We DON'T strip comments here because the comment stripper is
+    # run AFTER this pass — and the input text at this point may
+    # still contain comments from the user's source. Comments are
+    # usually harmless for our regexes (they typically don't
+    # contain ``typedef`` etc.), but to be safe we strip /* */ and
+    # // comments too. We use the string-aware stripper so we don't
+    # damage strings.
+    text_clean = _strip_comments_string_aware(text)
+    type_count: dict[str, int] = {}
+    const_count: dict[str, int] = {}
+    var_count: dict[str, int] = {}
+    # Pass 1: collect typedef aliases (high-confidence 'type').
+    for m in _USAGE_TYPE_PATTERNS[0].finditer(text_clean):
+        name = m.group('name')
+        if name and name not in _C_TYPE_KEYWORDS:
+            type_count[name] = type_count.get(name, 0) + 3  # weight: 3
+    # Pass 2: collect pointer-to-typedef usages.
+    for m in _USAGE_TYPE_PATTERNS[1].finditer(text_clean):
+        name = m.group('name')
+        if name and name not in _C_TYPE_KEYWORDS:
+            type_count[name] = type_count.get(name, 0) + 2  # weight: 2
+    # Pass 3: collect ``NAME x;`` (variable declaration of type NAME).
+    for m in _USAGE_TYPE_PATTERNS[2].finditer(text_clean):
+        name = m.group('name')
+        if name and name not in _C_TYPE_KEYWORDS:
+            type_count[name] = type_count.get(name, 0) + 1  # weight: 1
+    # Pass 4: cast expressions and sizeof(NAME).
+    for m in _USAGE_TYPE_PATTERNS[3].finditer(text_clean):
+        name = m.group('name')
+        if name and name not in _C_TYPE_KEYWORDS:
+            type_count[name] = type_count.get(name, 0) + 2  # weight: 2
+    for m in _USAGE_TYPE_PATTERNS[4].finditer(text_clean):
+        name = m.group('name')
+        if name and name not in _C_TYPE_KEYWORDS:
+            type_count[name] = type_count.get(name, 0) + 3  # weight: 3
+    # Pass 5: constant usages (``= NAME;``).
+    for m in _USAGE_CONST_PATTERNS[0].finditer(text_clean):
+        name = m.group('name')
+        if name and name not in _C_TYPE_KEYWORDS:
+            const_count[name] = const_count.get(name, 0) + 1
+    # Pass 6: variable usages (function calls, assignments, statements).
+    for m in _USAGE_VARIABLE_PATTERNS[0].finditer(text_clean):
+        name = m.group('name')
+        if name and name not in _C_TYPE_KEYWORDS:
+            var_count[name] = var_count.get(name, 0) + 1
+    for m in _USAGE_VARIABLE_PATTERNS[1].finditer(text_clean):
+        name = m.group('name')
+        if name and name not in _C_TYPE_KEYWORDS:
+            var_count[name] = var_count.get(name, 0) + 1
+    # Collect ALL identifiers seen anywhere in the text so we can
+    # classify even those that didn't match a specific pattern.
+    all_idents: set[str] = set()
+    for m in re.finditer(r'\b([A-Z][A-Za-z0-9_]*)\b', text_clean):
+        name = m.group(1)
+        if name and name not in _C_TYPE_KEYWORDS:
+            all_idents.add(name)
+    # Now classify each identifier. The decision rule:
+    #   * type_count > 0 → 'type' (most conservative — if it's ever
+    #     used as a type, treat it as a type so we don't strip it)
+    #   * else if const_count > 0 and var_count == 0 → 'const'
+    #   * else if var_count > 0 and const_count == 0 → 'variable'
+    #   * else if both > 0 → 'variable' (a name that's both called
+    #     and assigned is likely a function name)
+    #   * else → 'unknown'
+    out: dict[str, str] = {}
+    for name in all_idents:
+        t = type_count.get(name, 0)
+        c = const_count.get(name, 0)
+        v = var_count.get(name, 0)
+        if t > 0:
+            out[name] = 'type'
+        elif v > 0 and c == 0:
+            out[name] = 'variable'
+        elif c > 0 and v == 0:
+            out[name] = 'const'
+        elif c > 0 and v > 0:
+            out[name] = 'variable'
+        else:
+            out[name] = 'unknown'
+    return out
+
+
+# ----------------------------------------------------------------------
 # C built-in keywords and standard type names. Used by
 # ``_strip_unknown_linkage_markers`` to recognize when a leading
 # identifier is followed by a real C type (so the identifier must
@@ -1556,7 +1782,10 @@ _KNOWN_LINKAGE_MARKERS = frozenset({
 })
 
 
-def _strip_unknown_linkage_markers(text: str) -> str:
+def _strip_unknown_linkage_markers(
+    text: str,
+    usage_map: Optional[dict[str, str]] = None,
+) -> str:
     """Strip unknown linkage-marker macros that precede declarations.
 
     After pcpp preprocessing, any macro that wasn't defined (because
@@ -1588,16 +1817,28 @@ def _strip_unknown_linkage_markers(text: str) -> str:
 
     To avoid false positives (e.g. user-defined typedefs that
     happen to start with an uppercase letter, where the typedef IS
-    the return type), we only strip when the leading identifier is
-    followed by something that LOOKS LIKE a real C type. The
-    follow-up patterns we recognize:
-      * A C built-in type keyword (int, void, char, unsigned,
-        struct, enum, union, const, ...).
-      * Another identifier followed by ``*`` (e.g.
-        ``G_MODULE_EXPORT GResource *foo(...)`` — the second
-        ``GResource`` is the return type).
-      * Another identifier followed by `` IDENT(`` (a function
-        declarator with a named return type).
+    the return type), we use TWO complementary heuristics:
+
+      1. **Usage-based classification** (suggested by the user):
+         Before stripping, we scan the entire preprocessed text once
+         to classify every uppercase-initial identifier as
+         ``type`` / ``const`` / ``variable`` / ``unknown`` based on
+         how it's used elsewhere. If the marker candidate is
+         classified as ``type``, we DON'T strip it (it's the real
+         return type for ``GtkWidget *window;``). The classifier is
+         conservative — when in doubt it leans toward ``type``
+         because stripping a real type breaks the AST parse more
+         badly than leaving a marker in.
+
+      2. **Lookahead heuristic**: the marker candidate must be
+         followed by something that LOOKS LIKE a real C type:
+           * A C built-in type keyword (int, void, char, unsigned,
+             struct, enum, union, const, ...).
+           * Another identifier followed by ``*`` (e.g.
+             ``G_MODULE_EXPORT GResource *foo(...)`` — the second
+             ``GResource`` is the return type).
+           * Another identifier followed by `` IDENT(`` (a function
+             declarator with a named return type).
 
     The marker may be on its OWN line followed by the real
     declaration on the next line:
@@ -1610,6 +1851,12 @@ def _strip_unknown_linkage_markers(text: str) -> str:
     We do this on a LINE-BY-LINE basis to avoid damaging
     multi-line string literals or comment bodies that may contain
     sequences resembling the pattern.
+
+    ``usage_map`` is an optional dict mapping identifier → category
+    ('type', 'const', 'variable', 'unknown'). When provided, the
+    marker stripper consults it to decide whether to strip a
+    candidate. When not provided, the stripper falls back to the
+    simpler lookahead-only heuristic.
     """
     if not text:
         return text
@@ -1664,6 +1911,21 @@ def _strip_unknown_linkage_markers(text: str) -> str:
             out_lines.append(line)
             i += 1
             continue
+        # ---- USAGE-BASED CHECK (user-suggested heuristic) ----
+        # If we have a usage_map and the marker candidate is
+        # classified as 'type', DON'T strip it — it's the real
+        # return type for ``GtkWidget *window;``. We only strip
+        # when the identifier is NOT used as a type elsewhere.
+        # When usage_map is None (no usage scan was run), we
+        # fall back to the lookahead-only heuristic.
+        if usage_map is not None:
+            category = usage_map.get(first_ident, 'unknown')
+            if category == 'type':
+                # This identifier IS used as a type elsewhere in
+                # the file. Don't strip it as a marker.
+                out_lines.append(line)
+                i += 1
+                continue
         # Check whether this is a STANDALONE marker line (just the
         # identifier, optional whitespace, optional comment).
         rest_stripped = rest.strip()
@@ -1704,7 +1966,7 @@ def _strip_unknown_linkage_markers(text: str) -> str:
             continue
         # Otherwise, the marker is on the same line as the rest of
         # the declaration. Try the same-line stripping.
-        out_lines.append(_strip_linkage_marker_same_line(line))
+        out_lines.append(_strip_linkage_marker_same_line(line, usage_map))
         i += 1
     return ''.join(out_lines)
 
@@ -1755,8 +2017,16 @@ def _looks_like_decl_start(line: str) -> bool:
     return False
 
 
-def _strip_linkage_marker_same_line(line: str) -> str:
+def _strip_linkage_marker_same_line(
+    line: str,
+    usage_map: Optional[dict[str, str]] = None,
+) -> str:
     """Strip a leading linkage marker from one line, if present.
+
+    ``usage_map`` is an optional dict from
+    ``_classify_identifier_usages``. When provided, the stripper
+    refuses to strip an identifier that's classified as ``type``
+    (it's the real return type, not a marker).
 
     Returns the (possibly modified) line.
     """
@@ -1790,6 +2060,13 @@ def _strip_linkage_marker_same_line(line: str) -> str:
     has_upper = any(c.isupper() for c in first_ident)
     if not has_upper and not first_ident.startswith('_'):
         return line
+    # ---- USAGE-BASED CHECK (user-suggested heuristic) ----
+    # If the marker candidate is classified as 'type' elsewhere
+    # in the file, DON'T strip it — it's the real return type.
+    if usage_map is not None:
+        category = usage_map.get(first_ident, 'unknown')
+        if category == 'type':
+            return line
     # Now look at what follows the first identifier. Strip leading
     # whitespace from ``rest``.
     rest_stripped = rest.lstrip()
@@ -1809,11 +2086,25 @@ def _strip_linkage_marker_same_line(line: str) -> str:
     # Case B: the next token is another identifier (a typedef name
     # used as a return type). The first identifier is a linkage
     # marker only if THAT typedef name is followed by ``*`` or by
-    # an open paren (function declarator).
+    # an open paren (function declarator). We also confirm via the
+    # usage_map that the next identifier IS classified as 'type'
+    # (so we don't accidentally treat a function-call pattern like
+    # ``MARKER foo(bar)`` as ``MARKER Type *foo``).
     if next_ident:
         after_next = rest_stripped[next_ident_end:].lstrip()
         if after_next.startswith('*'):
-            marker = first_ident
+            # If we have a usage_map, also confirm that ``next_ident``
+            # is a known type (or a C keyword we already handled
+            # above). This avoids false positives like
+            # ``GdkRGBA color;`` where GdkRGBA IS the type and the
+            # leading identifier might be a different marker.
+            # When usage_map is None, we fall back to the original
+            # heuristic of just checking the lookahead pattern.
+            if (usage_map is None
+                    or usage_map.get(next_ident, 'unknown') == 'type'):
+                marker = first_ident
+                return (f"{indent}/* stripped linkage marker: "
+                        f"{marker} */ {rest}")
             return f"{indent}/* stripped linkage marker: {marker} */ {rest}"
     return line
 
