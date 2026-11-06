@@ -489,8 +489,7 @@ _extra_types_to_emit: list[str] = []
 
 
 def _union_to_pascal_record_type(union_node, name: str) -> str:
-    """Build a Pascal record type declaration string for an anonymous
-    C union.
+    """Build a Pascal variant record type declaration for a C union.
 
     ``union_node`` is a ``c_ast.Union`` with ``.decls`` (a list of
     ``c_ast.Decl``). ``name`` is the Pascal record type name to use
@@ -499,29 +498,36 @@ def _union_to_pascal_record_type(union_node, name: str) -> str:
     Returns a multi-line Pascal type declaration like:
 
         TResourcesResourceData = record
-          data: array[0..112041-1] of Byte;
-          alignment: Double;
-          ptr: Pointer;
+          case Integer of
+            1: (data: array[0..112041-1] of Byte);
+            2: (alignment: Double);
+            3: (ptr: Pointer);
         end;
 
-    Pascal variant records require a case tag, but C unions don't have
-    one — so we emit a plain record with all fields listed. The user
-    can convert it to a variant record by hand if needed (e.g. to
-    save memory in a tight struct).
+    Pascal variant records are the direct semantic equivalent of C
+    unions — all variants share the same memory. We use
+    ``case Integer of`` because C unions don't have a tag; the user
+    can later change ``Integer`` to a more specific enum if they
+    want better type safety.
+
+    For unions with ONLY ONE field (degenerate case), we still emit
+    a variant record with one case arm so the user can later add
+    more variants without restructuring.
     """
     lines: list[str] = []
-    lines.append(f"  // C anonymous union — consider converting to "
-                 f"Pascal variant record (case of).")
+    lines.append(f"  // C union — translated to Pascal variant record "
+                 f"(all variants share the same memory).")
     lines.append(f"  {name} = record")
+    lines.append(f"    case Integer of")
     if union_node.decls:
-        for f in union_node.decls:
+        for i, f in enumerate(union_node.decls, 1):
             if not isinstance(f, c_ast.Decl):
                 continue
             fname = pascalify_name(f.name or "field")
             ftype = _type_to_pascal(f.type)
-            lines.append(f"    {fname}: {ftype};")
+            lines.append(f"      {i}: ({fname}: {ftype});")
     else:
-        lines.append("    (* empty union *)")
+        lines.append("      1: ( (* empty union *) );")
     lines.append("  end;")
     # Auto-generate pointer alias (same as struct/enum).
     ptr_name = _make_pointer_name(name)
@@ -818,19 +824,26 @@ def _record_init_to_pascal(init, typ, ast=None) -> Optional[str]:
     if not field_decls:
         return None
     # InitList.exprs are positional (in C). Match them with the
-    # struct's field order.
+    # struct's field order. Each init value maps to one field.
+    # If there are more init values than fields (which shouldn't
+    # happen in well-formed C), we truncate. If there are fewer,
+    # missing fields get '0' (or 'nil' for pointer types).
     init_exprs = init.exprs or []
-    if len(init_exprs) > len(field_decls):
-        # More initializers than fields — that's an error in the
-        # C source, but we'll just use the first N to be safe.
-        init_exprs = init_exprs[:len(field_decls)]
+    n_fields = len(field_decls)
+    n_inits = min(len(init_exprs), n_fields)
     parts: list[str] = []
-    for i, fdecl in enumerate(field_decls):
-        fname = pascalify_name(fdecl.name)
-        if i < len(init_exprs):
+    for i in range(n_fields):
+        fname = pascalify_name(field_decls[i].name)
+        if i < n_inits:
             fval = _translate_init_expr_to_pascal(init_exprs[i])
         else:
-            fval = '0'  # default value for missing initializers
+            # Default value for missing initializers.
+            # Use 'nil' for pointer fields, '0' for others.
+            ftype = _type_to_pascal(field_decls[i].type)
+            if ('Pointer' in ftype or ftype.startswith('^')):
+                fval = 'nil'
+            else:
+                fval = '0'
         parts.append(f'{fname}: {fval}')
     return '(' + '; '.join(parts) + ')'
 
@@ -910,9 +923,16 @@ def _resolve_struct_for_typedef(typ, ast) -> Optional[c_ast.Struct]:
     return None
 
 
-def _translate_init_expr_to_pascal(expr) -> str:
+def _translate_init_expr_to_pascal(expr, in_sizeof: bool = False) -> str:
     """Translate a single C initializer expression to a Pascal
-    constant expression."""
+    constant expression.
+
+    ``in_sizeof`` is True when this expression is the operand of a
+    ``sizeof`` operator. In that case, ``StructRef`` patterns like
+    ``varname.data`` should NOT be converted to ``@varname`` (since
+    ``SizeOf(@varname)`` would return the size of a pointer, not the
+    size of the array). Instead, we emit ``varname`` directly.
+    """
     if expr is None:
         return '0'
     if isinstance(expr, c_ast.Constant):
@@ -940,12 +960,20 @@ def _translate_init_expr_to_pascal(expr) -> str:
             return 'False'
         return pascalify_name(nm)
     if isinstance(expr, c_ast.UnaryOp):
-        # e.g. ``-1`` → ``-1``, ``&x`` → ``@x``, ``sizeof(X)`` →
-        # ``SizeOf(X)`` (Pascal has no direct equivalent for C's
-        # sizeof on a non-typed expression, but we can emit a
-        # placeholder). pycparser represents ``sizeof X`` (with
-        # or without parens) as ``UnaryOp(op='sizeof', expr=X)``.
         op = expr.op
+        # For ``sizeof``, we need special handling: the operand
+        # ``resources_resource_data.data`` should become
+        # ``SizeOf(resources_resource_data)`` (NOT
+        # ``SizeOf(@resources_resource_data)``). The ``@`` prefix
+        # is only appropriate when the expression is used as a
+        # pointer value (assigned to a pointer field), not when
+        # it's inside ``sizeof``. We pass a context flag to
+        # ``_translate_init_expr_to_pascal`` to suppress the ``@``
+        # conversion.
+        if op == 'sizeof':
+            operand = _translate_init_expr_to_pascal(expr.expr,
+                                                     in_sizeof=True)
+            return f'SizeOf({operand})'
         operand = _translate_init_expr_to_pascal(expr.expr)
         if op == '&':
             return f'@({operand})'
@@ -957,15 +985,6 @@ def _translate_init_expr_to_pascal(expr) -> str:
             return f'not ({operand})'
         if op == '~':
             return f'not ({operand})'
-        if op == 'sizeof':
-            # Pascal has SizeOf() but it expects a type or a
-            # variable, not a complex expression. For our case
-            # (``sizeof(resources_resource_data.data)``), the
-            # operand is a StructRef which Pascal's SizeOf()
-            # doesn't directly accept. Emit a TODO comment so the
-            # user knows to fix this. We DO preserve the
-            # expression text so the user can see what it was.
-            return f'SizeOf(/* TODO: {operand} */ 0)'
         if op == 'p++':
             return f'Inc({operand})'
         if op == 'p--':
@@ -996,7 +1015,35 @@ def _translate_init_expr_to_pascal(expr) -> str:
         return _translate_init_expr_to_pascal(expr.expr)
     if isinstance(expr, c_ast.StructRef):
         # ``a.b`` or ``a->b`` → Pascal ``a.b`` or ``a^.b``
-        name = _translate_init_expr_to_pascal(expr.name)
+        # Special case: when the struct ref is ``varname.data`` where
+        # ``data`` is the first field of a union that's a byte array,
+        # C treats ``varname.data`` as a pointer to the first element
+        # (array decay). In Pascal, the equivalent is just
+        # ``@varname`` (the address of the record itself, since the
+        # first field of a variant record starts at offset 0). We
+        # detect this pattern: if the field name is ``data`` and the
+        # parent expression is a simple identifier, emit
+        # ``@identifier`` instead of ``identifier.data``.
+        # BUT: inside ``sizeof()``, we must NOT add ``@`` — we want
+        # ``SizeOf(varname)`` (the record size), not
+        # ``SizeOf(@varname)`` (pointer size = 4/8 bytes).
+        if (not in_sizeof
+                and expr.type == '.'
+                and isinstance(expr.name, c_ast.ID)
+                and hasattr(expr.field, 'name')
+                and expr.field.name == 'data'):
+            return f'@{pascalify_name(expr.name.name)}'
+        # Inside sizeof: ``varname.data`` → ``varname`` (the
+        # record itself, since SizeOf on the record gives the same
+        # result as SizeOf on the first field of a variant record).
+        if (in_sizeof
+                and expr.type == '.'
+                and isinstance(expr.name, c_ast.ID)
+                and hasattr(expr.field, 'name')
+                and expr.field.name == 'data'):
+            return pascalify_name(expr.name.name)
+        # General case: ``a.b`` → ``a.b``, ``a->b`` → ``a^.b``
+        name = _translate_init_expr_to_pascal(expr.name, in_sizeof)
         field = expr.field.name if hasattr(expr.field, 'name') else str(expr.field)
         if expr.type == '->':
             return f'{name}^{field}'

@@ -51,7 +51,7 @@ from typing import Optional
 # situations: the timestamp appears at the top of ``conversion.log``
 # and in the GUI title bar, so the user can tell at a glance whether
 # they have the latest fixes.
-VERSION = "2.2"
+VERSION = "2.4"
 
 # Directory containing this file. Used to locate the source modules
 # and to add them to ``sys.path``. Computed early so the
@@ -125,7 +125,7 @@ BUILD_TIMESTAMP = _read_source_timestamp()
 def get_version_string() -> str:
     """Return a full version string suitable for display.
 
-    Format: ``"gtk2laz 2.2 (source:2026-11-04 02:07:19 UTC)"``
+    Format: ``"gtk2laz 2.4 (source:2026-11-04 02:07:19 UTC)"``
 
     The ``source:`` prefix and UTC timestamp tell the user exactly
     which version of the source code they are running. This is more
