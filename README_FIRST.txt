@@ -1,4 +1,4 @@
-gtk2laz v1.8 - GTK to Lazarus converter
+gtk2laz v2.0 - GTK to Lazarus converter
 ========================================
 
 ply 패키지가 소스로 포함. pip install ply 불필요!

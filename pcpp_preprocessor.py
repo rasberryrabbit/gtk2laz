@@ -1545,13 +1545,13 @@ def _strip_comments_string_aware(text: str) -> str:
 # Usage-based identifier classifier (suggested by the user).
 #
 # Before stripping linkage markers, we scan the ENTIRE preprocessed
-# text and classify every uppercase-initial identifier based on
-# HOW it's used elsewhere in the file. This lets us distinguish
-# between:
-#   * GtkWidget (a TYPE — used in ``GtkWidget *window = NULL;``)
-#   * G_MODULE_EXPORT (a LINKAGE MARKER — never used as a type
-#     name; usually followed by a real type)
-#   * GTK_RESPONSE_OK (a CONSTANT — used in ``int x = GTK_RESPONSE_OK;``)
+# text and classify EVERY identifier (case-INsensitive — both
+# uppercase and lowercase initials) based on HOW it's used elsewhere
+# in the file. This lets us distinguish between:
+#   * GtkWidget, size_t, gint, gchar (TYPE — used in declarations)
+#   * G_MODULE_EXPORT (LINKAGE MARKER — never used as a type name)
+#   * GTK_RESPONSE_OK, BUFFER_SIZE (CONSTANT — used as values)
+#   * foo, get_widget (VARIABLE/FUNCTION — used as values/calls)
 #
 # Without this scan, we'd rely on a simple "followed by a C type
 # keyword" heuristic, which would falsely strip ``GtkWidget *foo;``
@@ -1559,39 +1559,63 @@ def _strip_comments_string_aware(text: str) -> str:
 # With the usage scan, we KNOW GtkWidget is a type (because it
 # appears in ``typedef struct _GtkWidget GtkWidget;``), so we don't
 # strip it.
+#
+# Why include lowercase-initial identifiers? Because C typedefs are
+# often lowercase (size_t, gint, gchar, pid_t, off_t, ssize_t,
+# guint, ...). If we only classify uppercase-initial names, we'd
+# miss the lowercase typedefs and might mistakenly strip a marker
+# that's actually a lowercase-typedef used as a return type:
+#   G_MODULE_EXPORT gint get_value(void);   // gint IS a type
+# We exclude identifiers that match the ``_C_TYPE_KEYWORDS`` set
+# (C built-in keywords like int/void/char/struct/...) so we don't
+# accidentally classify ``int`` as a type via the regex scan — that
+# would be redundant since we already short-circuit those in the
+# marker stripper.
 # ----------------------------------------------------------------------
 
 # Heuristic regex patterns that indicate the identifier is used as a
 # TYPE (not a constant or variable). Compiled once at module load.
+# Each pattern captures an identifier named ``name`` in the group.
+#
+# These patterns are written to match BOTH uppercase-initial names
+# (GtkWidget, GResource, ...) and lowercase-initial names (size_t,
+# gint, gchar, ...) — both are valid C typedef naming conventions.
+# We exclude C built-in keywords via ``name not in _C_TYPE_KEYWORDS``
+# after each match, so patterns that would otherwise match ``int x;``
+# (treating ``int`` as a typedef name) get filtered out.
 _USAGE_TYPE_PATTERNS = [
     # ``typedef ... NAME ...;`` — NAME is the typedef alias.
+    # Matches ``typedef struct _GtkWidget GtkWidget;`` (GtkWidget),
+    # ``typedef unsigned long size_t;`` (size_t),
+    # ``typedef int gint;`` (gint), etc.
     re.compile(
         r'\btypedef\b[^;]*?\b(?P<name>[A-Za-z_]\w*)\s*[;\[,{]',
         re.MULTILINE | re.DOTALL,
     ),
     # ``NAME *foo`` or ``NAME *foo,`` — pointer-to-typedef (NAME used
     # as a type). We require a space or `*` between NAME and ``*`` to
-    # avoid matching ``foo->bar``.
+    # avoid matching ``foo->bar``. Matches ``GtkWidget *window``,
+    # ``size_t *count``, ``gchar *str``, etc.
     re.compile(
-        r'\b(?P<name>[A-Z][A-Za-z0-9_]*)\s*\*\s*[A-Za-z_]\w*',
+        r'\b(?P<name>[A-Za-z_]\w*)\s*\*\s*[A-Za-z_]\w*',
     ),
     # ``NAME x;`` (without `*`) where x starts with lowercase —
-    # declaration of a variable of type NAME. We require NAME to
-    # start with uppercase (typical for typedef names) to avoid
-    # matching ``int x;`` (where ``int`` is a C keyword, not a
-    # typedef name).
+    # declaration of a variable of type NAME. Matches ``GtkWidget
+    # window;``, ``gint value;``, ``size_t length;``, etc.
+    # Note: the regex would also match ``int x;`` (treating ``int``
+    # as NAME), but we filter that out via ``name not in
+    # _C_TYPE_KEYWORDS`` in the classifier loop.
     re.compile(
-        r'\b(?P<name>[A-Z][A-Za-z0-9_]*)\s+[a-z_]\w*\s*[;,=]',
+        r'\b(?P<name>[A-Za-z_]\w*)\s+[a-z_]\w*\s*[;,=]',
     ),
-    # ``(NAME) expr`` — cast expression (NAME is a type).
-    # Avoids matching ``(foo) + 1`` (function call) by requiring the
-    # identifier inside the parens to start uppercase.
+    # ``(NAME) expr`` — cast expression (NAME is a type). Matches
+    # ``(GtkWidget)src``, ``(size_t)x``, ``(gint)value``, etc.
     re.compile(
-        r'\(\s*(?P<name>[A-Z][A-Za-z0-9_]*)\s*\)',
+        r'\(\s*(?P<name>[A-Za-z_]\w*)\s*\)',
     ),
     # ``sizeof(NAME)`` — NAME is a type.
     re.compile(
-        r'\bsizeof\s*\(\s*(?P<name>[A-Z][A-Za-z0-9_]*)\s*\)',
+        r'\bsizeof\s*\(\s*(?P<name>[A-Za-z_]\w*)\s*\)',
     ),
 ]
 
@@ -1599,22 +1623,19 @@ _USAGE_TYPE_PATTERNS = [
 # value) — not a type.
 _USAGE_CONST_PATTERNS = [
     # ``= NAME;`` or ``= NAME,`` or ``= NAME)`` — NAME used as a value
-    # in an assignment or initialization. (Note: this also matches
-    # enum constants like ``int x = GTK_RESPONSE_OK;``.)
+    # in an assignment or initialization. Matches both uppercase
+    # constants (``int x = GTK_RESPONSE_OK;``) and lowercase constants
+    # (rare but possible: ``int x = default_value;``).
     re.compile(
-        r'=\s*(?P<name>[A-Z][A-Z0-9_]*)\s*[;,)\]]',
+        r'=\s*(?P<name>[A-Za-z_]\w*)\s*[;,)\]]',
     ),
-    # ``NAME,`` or ``NAME)`` inside an enum body — enum constant.
-    # We check the surrounding context to ensure we're inside a
-    # ``enum { ... NAME ... }`` block.
-    # This pattern is too noisy in general code; we only check it
-    # inside enum bodies (handled in the classifier function).
 ]
 
 # Patterns that indicate the identifier is a VARIABLE/FUNCTION
 # (not a type or constant).
 _USAGE_VARIABLE_PATTERNS = [
     # ``NAME(...)`` — function call or function definition.
+    # Matches both ``get_widget()`` and ``G_MODULE_EXPORT_FUNC()``.
     re.compile(
         r'\b(?P<name>[A-Za-z_]\w*)\s*\(',
     ),
@@ -1623,17 +1644,17 @@ _USAGE_VARIABLE_PATTERNS = [
     re.compile(
         r'\b(?P<name>[A-Za-z_]\w*)\s*=\s*[^=]',
     ),
-    # ``NAME;`` — bare statement (e.g. ``x;``). We restrict to
-    # lowercase identifiers since uppercase-only ones are typically
-    # constants.
+    # ``NAME;`` — bare statement (e.g. ``x;``). We match any identifier
+    # here; the classifier loop will weight uppercase constants
+    # higher via the const patterns.
     re.compile(
-        r'\b(?P<name>[a-z_]\w*)\s*;',
+        r'\b(?P<name>[A-Za-z_]\w*)\s*;',
     ),
 ]
 
 
 def _classify_identifier_usages(text: str) -> dict[str, str]:
-    """Scan ``text`` and classify each uppercase-initial identifier.
+    """Scan ``text`` and classify every identifier (case-INsensitive).
 
     Returns a dict mapping identifier → category, where category is
     one of:
@@ -1641,6 +1662,15 @@ def _classify_identifier_usages(text: str) -> dict[str, str]:
       * 'const'    — used as a constant value
       * 'variable' — used as a variable or function name
       * 'unknown'  — no usages detected (or tie between categories)
+
+    The classifier is case-INsensitive in the sense that it considers
+    BOTH uppercase-initial identifiers (GtkWidget, GResource) and
+    lowercase-initial identifiers (size_t, gint, gchar, pid_t, ...).
+    This is critical because C typedefs are often lowercase — without
+    including them, we'd miss the fact that ``gint`` is a type and
+    might strip a marker that's actually a lowercase-typedef used as
+    a return type:
+        G_MODULE_EXPORT gint get_value(void);   // gint IS a type
 
     The category is determined by counting how many times the
     identifier matches each kind of pattern. If 'type' patterns win,
@@ -1654,6 +1684,11 @@ def _classify_identifier_usages(text: str) -> dict[str, str]:
     badly than leaving a marker in (pycparser will still choke on
     the marker, but at least it will report a clearer error pointing
     to the marker rather than to a stripped type).
+
+    Identifiers in ``_C_TYPE_KEYWORDS`` (C built-in keywords like
+    ``int``, ``void``, ``struct``, ...) are SKIPPED — we don't
+    classify them because the marker stripper already short-circuits
+    on them (they're never markers).
     """
     if not text:
         return {}
@@ -1670,50 +1705,48 @@ def _classify_identifier_usages(text: str) -> dict[str, str]:
     type_count: dict[str, int] = {}
     const_count: dict[str, int] = {}
     var_count: dict[str, int] = {}
+
+    def bump(d: dict, name: str, weight: int) -> None:
+        """Increment ``name``'s count in ``d`` by ``weight``, but
+        only if ``name`` is not a C language keyword or a known C
+        library type alias (those are already handled separately by
+        the marker stripper)."""
+        if name and name not in _C_ALL_KNOWN_TYPES:
+            d[name] = d.get(name, 0) + weight
+
     # Pass 1: collect typedef aliases (high-confidence 'type').
     for m in _USAGE_TYPE_PATTERNS[0].finditer(text_clean):
-        name = m.group('name')
-        if name and name not in _C_TYPE_KEYWORDS:
-            type_count[name] = type_count.get(name, 0) + 3  # weight: 3
+        bump(type_count, m.group('name'), 3)
     # Pass 2: collect pointer-to-typedef usages.
     for m in _USAGE_TYPE_PATTERNS[1].finditer(text_clean):
-        name = m.group('name')
-        if name and name not in _C_TYPE_KEYWORDS:
-            type_count[name] = type_count.get(name, 0) + 2  # weight: 2
+        bump(type_count, m.group('name'), 2)
     # Pass 3: collect ``NAME x;`` (variable declaration of type NAME).
     for m in _USAGE_TYPE_PATTERNS[2].finditer(text_clean):
-        name = m.group('name')
-        if name and name not in _C_TYPE_KEYWORDS:
-            type_count[name] = type_count.get(name, 0) + 1  # weight: 1
+        bump(type_count, m.group('name'), 1)
     # Pass 4: cast expressions and sizeof(NAME).
     for m in _USAGE_TYPE_PATTERNS[3].finditer(text_clean):
-        name = m.group('name')
-        if name and name not in _C_TYPE_KEYWORDS:
-            type_count[name] = type_count.get(name, 0) + 2  # weight: 2
+        bump(type_count, m.group('name'), 2)
     for m in _USAGE_TYPE_PATTERNS[4].finditer(text_clean):
-        name = m.group('name')
-        if name and name not in _C_TYPE_KEYWORDS:
-            type_count[name] = type_count.get(name, 0) + 3  # weight: 3
+        bump(type_count, m.group('name'), 3)
     # Pass 5: constant usages (``= NAME;``).
     for m in _USAGE_CONST_PATTERNS[0].finditer(text_clean):
-        name = m.group('name')
-        if name and name not in _C_TYPE_KEYWORDS:
-            const_count[name] = const_count.get(name, 0) + 1
+        bump(const_count, m.group('name'), 1)
     # Pass 6: variable usages (function calls, assignments, statements).
     for m in _USAGE_VARIABLE_PATTERNS[0].finditer(text_clean):
-        name = m.group('name')
-        if name and name not in _C_TYPE_KEYWORDS:
-            var_count[name] = var_count.get(name, 0) + 1
+        bump(var_count, m.group('name'), 1)
     for m in _USAGE_VARIABLE_PATTERNS[1].finditer(text_clean):
-        name = m.group('name')
-        if name and name not in _C_TYPE_KEYWORDS:
-            var_count[name] = var_count.get(name, 0) + 1
+        bump(var_count, m.group('name'), 1)
+    for m in _USAGE_VARIABLE_PATTERNS[2].finditer(text_clean):
+        bump(var_count, m.group('name'), 1)
     # Collect ALL identifiers seen anywhere in the text so we can
     # classify even those that didn't match a specific pattern.
+    # Match any identifier (uppercase- or lowercase-initial).
+    # Skip C language keywords AND C library type aliases — those are
+    # already known to the marker stripper and don't need classification.
     all_idents: set[str] = set()
-    for m in re.finditer(r'\b([A-Z][A-Za-z0-9_]*)\b', text_clean):
+    for m in re.finditer(r'\b([A-Za-z_]\w*)\b', text_clean):
         name = m.group(1)
-        if name and name not in _C_TYPE_KEYWORDS:
+        if name and name not in _C_ALL_KNOWN_TYPES:
             all_idents.add(name)
     # Now classify each identifier. The decision rule:
     #   * type_count > 0 → 'type' (most conservative — if it's ever
@@ -1742,10 +1775,17 @@ def _classify_identifier_usages(text: str) -> dict[str, str]:
 
 
 # ----------------------------------------------------------------------
-# C built-in keywords and standard type names. Used by
-# ``_strip_unknown_linkage_markers`` to recognize when a leading
-# identifier is followed by a real C type (so the identifier must
-# be a linkage marker, not the type itself).
+# C language keywords. Used by ``_strip_unknown_linkage_markers`` to
+# recognize when a leading identifier is a C language keyword (so it
+# can't be a linkage marker — language keywords are reserved by the
+# compiler and can never be redefined as macros).
+#
+# This set contains ONLY true C language keywords: primitive types,
+# qualifiers, storage classes, and compiler built-in types
+# (``__int8`` etc.). It does NOT contain library-provided typedefs
+# like ``size_t`` — those go in ``_C_LIBC_TYPE_ALIASES`` because they
+# are NOT language keywords (they're typedefs declared in <stddef.h>
+# / <stdio.h> / <stdlib.h> etc.).
 # ----------------------------------------------------------------------
 _C_TYPE_KEYWORDS = frozenset({
     # C primitive types and qualifiers
@@ -1756,12 +1796,78 @@ _C_TYPE_KEYWORDS = frozenset({
     # language, not from a macro)
     'extern', 'static', 'auto', 'register', 'inline', '_Noreturn',
     'typedef',
-    # GCC/MSVC built-in types that pycparser does NOT know but
-    # that we treat as types anyway (after pcpp has expanded them)
+    # GCC/MSVC compiler built-in types (these are compiler extensions
+    # that pycparser does NOT know, but they ARE part of the language
+    # dialect — not library typedefs).
     '__int8', '__int16', '__int32', '__int64',
     '__uint8', '__uint16', '__uint32', '__uint64',
-    'size_t', 'ssize_t', 'ptrdiff_t', 'wchar_t',
 })
+
+# ----------------------------------------------------------------------
+# C standard library type aliases (typedefs defined in <stddef.h>,
+# <stdio.h>, <stdlib.h>, <sys/types.h>, etc.). These are NOT language
+# keywords — they're typedefs declared in headers. The fake libc
+# headers we ship (``gen_fake_includes.py``) define these as real
+# typedefs, so pycparser sees them as known types after preprocessing.
+#
+# We list them separately so the marker stripper can:
+#   * NOT treat them as linkage markers (they're real types)
+#   * NOT classify them via the usage-based classifier (they're
+#     already known types — no need to scan for usages)
+#   * Distinguish "language keyword" (``int``, ``void``) from
+#     "library typedef" (``size_t``) for diagnostic purposes
+#
+# Common examples:
+#   * size_t     — <stddef.h>, <stdio.h>, <stdlib.h>
+#   * ssize_t    — <sys/types.h>, POSIX
+#   * ptrdiff_t  — <stddef.h>
+#   * wchar_t    — <stddef.h> (also a C++ keyword, but in C it's a
+#                  typedef)
+#   * wint_t     — <wchar.h>, <wctype.h>
+#   * time_t     — <time.h>
+#   * clock_t    — <time.h>
+#   * FILE       — <stdio.h>
+#   * fpos_t     — <stdio.h>
+#   * div_t      — <stdlib.h>
+#   * ldiv_t     — <stdlib.h>
+#   * jmp_buf    — <setjmp.h>
+#   * sig_atomic_t — <signal.h>
+#   * pid_t, uid_t, gid_t — <sys/types.h>, POSIX
+#   * off_t      — <sys/types.h>, <stdio.h>
+#   * mode_t     — <sys/types.h>, <sys/stat.h>
+#   * ssize_t    — <sys/types.h>, POSIX
+# ----------------------------------------------------------------------
+_C_LIBC_TYPE_ALIASES = frozenset({
+    # <stddef.h>
+    'size_t', 'ptrdiff_t', 'wchar_t', 'max_align_t',
+    # <stdint.h> (also often typedef'd in our fake headers)
+    'int8_t', 'int16_t', 'int32_t', 'int64_t',
+    'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+    'intptr_t', 'uintptr_t', 'intmax_t', 'uintmax_t',
+    # <stdio.h>
+    'FILE', 'fpos_t',
+    # <stdlib.h>
+    'div_t', 'ldiv_t', 'lldiv_t',
+    # <time.h>
+    'time_t', 'clock_t',
+    # <wchar.h> / <wctype.h>
+    'wint_t', 'mbstate_t',
+    # <setjmp.h>
+    'jmp_buf', 'sigjmp_buf',
+    # <signal.h>
+    'sig_atomic_t',
+    # POSIX <sys/types.h>
+    'ssize_t', 'pid_t', 'uid_t', 'gid_t', 'off_t', 'mode_t',
+    'dev_t', 'ino_t', 'nlink_t', 'blkcnt_t', 'blksize_t',
+    'timeval_t', 'timespec_t',
+    # Used in many places; commonly typedef'd
+    'caddr_t', 'ssize_t',
+})
+
+# Combined set: any identifier in EITHER set is treated as a known
+# type by the marker stripper (skip — it's not a marker). The
+# classifier also skips these because they're already known.
+_C_ALL_KNOWN_TYPES = _C_TYPE_KEYWORDS | _C_LIBC_TYPE_ALIASES
 
 # Linkage markers we KNOW about. We still pre-strip these via
 # ``gnu_defines`` in ``preprocess()``, but listing them here lets
@@ -1899,18 +2005,39 @@ def _strip_unknown_linkage_markers(
             j += 1
         first_ident = stripped[:j]
         rest = stripped[j:]
-        # Skip if the identifier is a C keyword or known type.
-        if first_ident in _C_TYPE_KEYWORDS:
+        # Skip if the identifier is a C language keyword OR a C library
+        # type alias (size_t, FILE, pid_t, ...). Both are real types
+        # and never linkage markers.
+        if first_ident in _C_ALL_KNOWN_TYPES:
             out_lines.append(line)
             i += 1
             continue
         # Skip if it's all-lowercase and doesn't start with ``_``
-        # (those are not linkage markers).
+        # (those are usually regular variables, not linkage markers).
+        # BUT: when we have a usage_map, we trust it — if the
+        # classifier says the marker candidate is NOT a type (i.e.
+        # 'const', 'variable', or 'unknown'), we should consider
+        # stripping it even if it's lowercase. This handles
+        # lowercase-initial linkage markers like
+        # ``_GLIB_EXTERN int foo();`` (which is all-lowercase after
+        # the leading ``_``). When usage_map is None (no scan was
+        # run), we keep the conservative all-lowercase exclusion.
         has_upper = any(c.isupper() for c in first_ident)
         if not has_upper and not first_ident.startswith('_'):
-            out_lines.append(line)
-            i += 1
-            continue
+            if usage_map is None:
+                out_lines.append(line)
+                i += 1
+                continue
+            # usage_map is provided — check the classification.
+            # If the classifier says 'type', skip (handled below).
+            # Otherwise, fall through to the marker-stripping
+            # logic so we can strip lowercase markers too.
+            category = usage_map.get(first_ident, 'unknown')
+            if category == 'type':
+                out_lines.append(line)
+                i += 1
+                continue
+            # else: not a type, may be a marker — fall through.
         # ---- USAGE-BASED CHECK (user-suggested heuristic) ----
         # If we have a usage_map and the marker candidate is
         # classified as 'type', DON'T strip it — it's the real
@@ -1998,9 +2125,9 @@ def _looks_like_decl_start(line: str) -> bool:
         return False
     first = line[:i]
     rest = line[i:].lstrip()
-    # If the first identifier is a known C type keyword, this looks
-    # like a declaration.
-    if first in _C_TYPE_KEYWORDS:
+    # If the first identifier is a known C keyword OR a C library type
+    # alias (size_t, FILE, ...), this looks like a declaration.
+    if first in _C_ALL_KNOWN_TYPES:
         return True
     # Otherwise, the first identifier is a typedef name. The next
     # token must be ``*`` (pointer) or another identifier (variable
@@ -2052,14 +2179,26 @@ def _strip_linkage_marker_same_line(
         i += 1
     first_ident = stripped[:i]
     rest = stripped[i:]
-    # Skip if the identifier is a C keyword or known type.
-    if first_ident in _C_TYPE_KEYWORDS:
+    # Skip if the identifier is a C language keyword OR a C library
+    # type alias (size_t, FILE, ...). Both are real types and never
+    # linkage markers.
+    if first_ident in _C_ALL_KNOWN_TYPES:
         return line
     # Skip if it's all-lowercase (typical for C identifiers in
-    # function bodies — these are not linkage markers).
+    # function bodies — these are usually variables, not markers).
+    # BUT: when usage_map is provided, we trust it — if the
+    # classifier says the marker candidate is NOT a 'type', we
+    # consider stripping it even if it's lowercase. This handles
+    # lowercase-initial linkage markers.
     has_upper = any(c.isupper() for c in first_ident)
     if not has_upper and not first_ident.startswith('_'):
-        return line
+        if usage_map is None:
+            return line
+        # usage_map is provided — check the classification.
+        category = usage_map.get(first_ident, 'unknown')
+        if category == 'type':
+            return line
+        # else: not a type, may be a marker — fall through.
     # ---- USAGE-BASED CHECK (user-suggested heuristic) ----
     # If the marker candidate is classified as 'type' elsewhere
     # in the file, DON'T strip it — it's the real return type.
@@ -2080,7 +2219,7 @@ def _strip_linkage_marker_same_line(
                 or rest_stripped[next_ident_end] == '_')):
         next_ident_end += 1
     next_ident = rest_stripped[:next_ident_end]
-    if next_ident in _C_TYPE_KEYWORDS:
+    if next_ident in _C_ALL_KNOWN_TYPES:
         marker = first_ident
         return f"{indent}/* stripped linkage marker: {marker} */ {rest}"
     # Case B: the next token is another identifier (a typedef name
