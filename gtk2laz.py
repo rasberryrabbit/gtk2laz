@@ -51,7 +51,7 @@ from typing import Optional
 # situations: the timestamp appears at the top of ``conversion.log``
 # and in the GUI title bar, so the user can tell at a glance whether
 # they have the latest fixes.
-VERSION = "2.5"
+VERSION = "2.6"
 
 # Directory containing this file. Used to locate the source modules
 # and to add them to ``sys.path``. Computed early so the
@@ -125,7 +125,7 @@ BUILD_TIMESTAMP = _read_source_timestamp()
 def get_version_string() -> str:
     """Return a full version string suitable for display.
 
-    Format: ``"gtk2laz 2.5 (source:2026-11-04 02:07:19 UTC)"``
+    Format: ``"gtk2laz 2.6 (source:2026-11-04 02:07:19 UTC)"``
 
     The ``source:`` prefix and UTC timestamp tell the user exactly
     which version of the source code they are running. This is more
@@ -523,7 +523,9 @@ def convert(input_dir: str, output_dir: str,
             c_only: bool = False,
             progress_callback=None,
             target_platform: str = "auto",
-            extra_defines: Optional[list[str]] = None) -> dict:
+            extra_defines: Optional[list[str]] = None,
+            force_types: Optional[list[str]] = None,
+            force_consts: Optional[list[str]] = None) -> dict:
     """Convert a GTK source tree into a Lazarus project.
 
     When ``c_only`` is True, the Glade form is skipped and only the C
@@ -563,6 +565,17 @@ def convert(input_dir: str, output_dir: str,
     try:
         from pcpp_preprocessor import set_extra_defines
         set_extra_defines(extra_defines)
+    except Exception:
+        pass
+
+    # Set the global force-type / force-const lists so every
+    # ``_classify_identifier_usages()`` call picks them up. This lets
+    # the user override the usage-based classifier when the heuristic
+    # gets the category wrong for a specific identifier.
+    try:
+        from pcpp_preprocessor import set_force_types, set_force_consts
+        set_force_types(force_types)
+        set_force_consts(force_consts)
     except Exception:
         pass
 
@@ -1097,6 +1110,21 @@ def _add_common_args(p: argparse.ArgumentParser) -> None:
                    metavar="NAME[=VALUE]",
                    help="Pre-define a macro before preprocessing "
                         "(repeatable; like gcc's -D)")
+    # Force-type: tell the identifier classifier to treat these as
+    # types (not constants or linkage markers). Useful when the
+    # heuristic classifier misclassifies a typedef that only appears
+    # in its own declaration with no usages elsewhere.
+    p.add_argument("--force-type", action="append", default=[],
+                   metavar="NAME",
+                   help="Force-classify an identifier as a TYPE "
+                        "(repeatable; e.g. --force-type GtkWidget)")
+    # Force-const: tell the classifier to treat these as constants
+    # (not types). Useful when a macro-defined constant looks like a
+    # type name to the heuristic classifier.
+    p.add_argument("--force-const", action="append", default=[],
+                   metavar="NAME",
+                   help="Force-classify an identifier as a CONSTANT "
+                        "(repeatable; e.g. --force-const GTK_RESPONSE_OK)")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1139,6 +1167,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                        metavar="NAME[=VALUE]",
                        help="Pre-define a macro before preprocessing "
                             "(repeatable; like gcc's -D)")
+    p_c2p.add_argument("--force-type", action="append", default=[],
+                       metavar="NAME",
+                       help="Force-classify an identifier as a TYPE "
+                            "(repeatable)")
+    p_c2p.add_argument("--force-const", action="append", default=[],
+                       metavar="NAME",
+                       help="Force-classify an identifier as a CONSTANT "
+                            "(repeatable)")
 
     # gui: launch the interactive GUI
     p_gui = sub.add_parser("gui",
@@ -1209,7 +1245,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                              report_path=args.report,
                              c_only=True,
                              target_platform=getattr(args, "platform", "auto"),
-                             extra_defines=getattr(args, "define", None))
+                             extra_defines=getattr(args, "define", None),
+                             force_types=getattr(args, "force_type", None),
+                             force_consts=getattr(args, "force_const", None))
         finally:
             _end_log_capture(_log_path)
             print(f"  Log:    {_log_path}")
@@ -1241,7 +1279,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                              report_path=args.report,
                              c_only=c_only_arg,
                              target_platform=getattr(args, "platform", "auto"),
-                             extra_defines=getattr(args, "define", None))
+                             extra_defines=getattr(args, "define", None),
+                             force_types=getattr(args, "force_type", None),
+                             force_consts=getattr(args, "force_const", None))
         finally:
             _end_log_capture(_log_path)
             print(f"  Log:    {_log_path}")

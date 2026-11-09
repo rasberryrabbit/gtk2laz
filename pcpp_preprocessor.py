@@ -58,6 +58,52 @@ except ImportError:
 # CFileTranslator → parse_with_ast → AstToPascal.parse → preprocess).
 _GLOBAL_EXTRA_DEFINES: list[str] = []
 
+# ----------------------------------------------------------------------
+# User-overridable identifier classification lists.
+#
+# Sometimes the usage-based classifier (``_classify_identifier_usages``)
+# can't determine the correct category for an identifier because the
+# identifier is only used in one place (e.g. a typedef only appears in
+# its own declaration, with no usages elsewhere). The classifier would
+# then return 'unknown', and the marker stripper might incorrectly strip
+# it as a linkage marker.
+#
+# The user can force an identifier to be treated as a TYPE or a
+# CONSTANT via the CLI options ``--force-type`` and ``--force-const``.
+# These lists are checked BEFORE the usage-based classifier, so they
+# take priority.
+#
+# Example CLI usage:
+#   gtk2laz convert src/ out/ --force-type MyType,OtherType
+#   gtk2laz convert src/ out/ --force-const MY_CONST
+# ----------------------------------------------------------------------
+_GLOBAL_FORCE_TYPES: list[str] = []
+_GLOBAL_FORCE_CONSTS: list[str] = []
+
+
+def set_force_types(types: Optional[list[str]]) -> None:
+    """Set the global list of identifiers to force-classify as 'type'.
+
+    Called once by ``gtk2laz.convert()`` when the user passes
+    ``--force-type`` on the CLI. Every subsequent
+    ``_classify_identifier_usages()`` call will treat these
+    identifiers as 'type' regardless of what the heuristic patterns say.
+    """
+    global _GLOBAL_FORCE_TYPES
+    _GLOBAL_FORCE_TYPES = list(types or [])
+
+
+def set_force_consts(consts: Optional[list[str]]) -> None:
+    """Set the global list of identifiers to force-classify as 'const'.
+
+    Called once by ``gtk2laz.convert()`` when the user passes
+    ``--force-const`` on the CLI. Every subsequent
+    ``_classify_identifier_usages()`` call will treat these
+    identifiers as 'const' regardless of what the heuristic patterns say.
+    """
+    global _GLOBAL_FORCE_CONSTS
+    _GLOBAL_FORCE_CONSTS = list(consts or [])
+
 
 def _inline_local_includes_only(c_path: str) -> str:
     """Pre-inline every ``#include "..."`` header BEFORE pcpp runs.
@@ -1748,7 +1794,25 @@ def _classify_identifier_usages(text: str) -> dict[str, str]:
         name = m.group(1)
         if name and name not in _C_ALL_KNOWN_TYPES:
             all_idents.add(name)
+    # Build a set of force-type and force-const identifiers from the
+    # global lists (set by ``set_force_types`` / ``set_force_consts``
+    # via the ``--force-type`` / ``--force-const`` CLI options).
+    # These take PRIORITY over the heuristic classification.
+    force_type_set = set(_GLOBAL_FORCE_TYPES)
+    force_const_set = set(_GLOBAL_FORCE_CONSTS)
+    # Also add forced identifiers that weren't seen in the text at all
+    # — the user might force-classify an identifier that only appears
+    # in a #define (which pcpp already expanded away) or that hasn't
+    # been used yet but will be used later in the code.
+    for ft in force_type_set:
+        all_idents.add(ft)
+    for fc in force_const_set:
+        all_idents.add(fc)
     # Now classify each identifier. The decision rule:
+    #   * If the identifier is in the force-type list → 'type'
+    #     (user override takes priority)
+    #   * If the identifier is in the force-const list → 'const'
+    #     (user override takes priority)
     #   * type_count > 0 → 'type' (most conservative — if it's ever
     #     used as a type, treat it as a type so we don't strip it)
     #   * else if const_count > 0 and var_count == 0 → 'const'
@@ -1758,6 +1822,12 @@ def _classify_identifier_usages(text: str) -> dict[str, str]:
     #   * else → 'unknown'
     out: dict[str, str] = {}
     for name in all_idents:
+        if name in force_type_set:
+            out[name] = 'type'
+            continue
+        if name in force_const_set:
+            out[name] = 'const'
+            continue
         t = type_count.get(name, 0)
         c = const_count.get(name, 0)
         v = var_count.get(name, 0)
